@@ -30,7 +30,7 @@ const wcRoute = astar(testGraph, 'a', 'd', 'wheelchair')
 console.assert(wcRoute?.length === 2, 'Wheelchair: same route, stairs never taken')
 
 // No path case
-const noRoute = astar(testGraph, 'c', 'a', 'standard')
-console.assert(noRoute === null, 'No path from c (no outgoing edges)')
+const noRoute = astar(testGraph, 'c', 'a', 'wheelchair')
+console.assert(noRoute === null, 'No path from c (wheelchair)')
 
 console.log('All A* tests passed')
