@@ -26,10 +26,15 @@ export default function EntryPage() {
   // 1. Fetch hospitals on mount
   useEffect(() => {
     async function loadHospitals() {
-      const { data, error } = await supabase.from('hospitals').select('id, name')
-      if (error) console.error('Error fetching hospitals:', error)
-      if (data) setHospitals(data)
-      setLoadingHospitals(false)
+      try {
+        const { data, error } = await supabase.from('hospitals').select('id, name')
+        if (error) console.error('Error fetching hospitals:', error)
+        if (data) setHospitals(data)
+      } catch (err) {
+        console.error('Fetch exception:', err)
+      } finally {
+        setLoadingHospitals(false)
+      }
     }
     loadHospitals()
   }, [supabase])

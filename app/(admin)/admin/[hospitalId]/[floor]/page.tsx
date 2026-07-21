@@ -1,7 +1,7 @@
 'use client'
 import { useState, useRef, useEffect, use } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Plus, Maximize, MousePointer2, Move, Upload, Save, X } from 'lucide-react'
+import { Plus, Maximize, MousePointer2, Move, Upload, Save, X, ZoomIn, ZoomOut } from 'lucide-react'
 
 type Mode = 'calibrating' | 'placing-nodes' | 'placing-edges'
 type CalibrationStep = 'point-a' | 'point-b' | 'enter-distance' | 'done'
@@ -37,6 +37,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const [nodes, setNodes] = useState<NodeData[]>([])
   const [edges, setEdges] = useState<EdgeData[]>([])
   const [loading, setLoading] = useState(true)
+  const [zoom, setZoom] = useState(1)
 
   // Calibration state
   const [calibStep, setCalibStep] = useState<CalibrationStep>('point-a')
@@ -197,11 +198,11 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
 
   function handleImageClick(e: React.MouseEvent<HTMLImageElement>) {
     const rect = e.currentTarget.getBoundingClientRect()
-    // Calculate click position relative to the image's rendered dimensions
-    // We also need to factor in scaling if the image is displayed smaller than its natural size.
-    // Easiest is to use nativeEvent.offsetX / offsetY since the img has no padding.
-    const px = e.nativeEvent.offsetX
-    const py = e.nativeEvent.offsetY
+    // Calculate click position relative to the image's original dimensions
+    // nativeEvent.offsetX / offsetY gives coordinates relative to the rendered size.
+    // We divide by zoom to get back to the original pixels.
+    const px = e.nativeEvent.offsetX / zoom
+    const py = e.nativeEvent.offsetY / zoom
 
     if (mode === 'calibrating') {
       handleCalibrationClick(px, py)
@@ -339,11 +340,11 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   return (
     <div className="min-h-screen bg-background flex flex-col h-screen overflow-hidden">
       {/* Top Toolbar */}
-      <div className="h-16 border-b border-border bg-black/80 backdrop-blur-xl flex items-center justify-between px-6 shrink-0 z-10">
+      <div className="min-h-16 h-auto py-3 md:py-0 border-b border-border bg-black/80 backdrop-blur-xl flex flex-col md:flex-row items-start md:items-center justify-between px-4 md:px-6 gap-3 shrink-0 z-10">
         <div>
           <h1 className="font-medium text-lg">Hospital {hospitalId} <span className="text-muted-foreground mx-2">/</span> Floor {floorNumber}</h1>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           {!scaleMpp && (
             <div className="px-3 py-1 bg-yellow-500/10 text-yellow-500 text-sm font-medium rounded-full border border-yellow-500/20">
               Calibration Required
@@ -369,14 +370,24 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           >
             <Move size={16} className="mr-2" /> Edges
           </button>
+          
+          <div className="flex items-center gap-1 border-l border-border/50 pl-2 ml-2">
+            <button onClick={() => setZoom(z => Math.max(0.1, z - 0.2))} className="p-2 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground">
+              <ZoomOut size={18} />
+            </button>
+            <span className="text-xs font-mono w-10 text-center">{Math.round(zoom * 100)}%</span>
+            <button onClick={() => setZoom(z => Math.min(3, z + 0.2))} className="p-2 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground">
+              <ZoomIn size={18} />
+            </button>
+          </div>
         </div>
       </div>
 
       {/* Editor Workspace */}
-      <div className="flex-1 overflow-auto bg-[#0a0a0a] relative p-8">
+      <div className="flex-1 overflow-auto bg-[#0a0a0a] relative p-0 sm:p-4 md:p-8">
         
         {/* Helper text overlay */}
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-black/80 backdrop-blur-md px-6 py-3 rounded-full text-sm border border-border shadow-2xl z-20 pointer-events-none">
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-black/80 backdrop-blur-md px-4 md:px-6 py-2 md:py-3 rounded-full text-xs md:text-sm border border-border shadow-2xl z-20 pointer-events-none whitespace-nowrap">
           {mode === 'calibrating' && calibStep === 'point-a' && 'Click a point to start calibration'}
           {mode === 'calibrating' && calibStep === 'point-b' && 'Click a second point to measure'}
           {mode === 'calibrating' && calibStep === 'enter-distance' && 'Enter the real-world distance'}
@@ -392,12 +403,16 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
             className={`block max-w-none ${mode === 'calibrating' ? 'cursor-crosshair' : mode === 'placing-nodes' ? 'cursor-cell' : 'cursor-pointer'}`}
             draggable={false}
             ref={imgRef}
+            style={{ width: imgRef.current?.naturalWidth ? imgRef.current.naturalWidth * zoom : undefined }}
           />
           
           <svg
-            className="absolute inset-0 w-full h-full pointer-events-none"
-            viewBox={`0 0 ${imgRef.current?.width || 0} ${imgRef.current?.height || 0}`}
-            style={{ width: imgRef.current?.width, height: imgRef.current?.height }}
+            className="absolute inset-0 pointer-events-none"
+            viewBox={`0 0 ${imgRef.current?.naturalWidth || 0} ${imgRef.current?.naturalHeight || 0}`}
+            style={{ 
+              width: imgRef.current?.naturalWidth ? imgRef.current.naturalWidth * zoom : undefined, 
+              height: imgRef.current?.naturalHeight ? imgRef.current.naturalHeight * zoom : undefined 
+            }}
           >
             {/* Draw Edges */}
             {edges.map(edge => {
@@ -476,8 +491,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
 
       {/* Calibration Distance Input */}
       {mode === 'calibrating' && calibStep === 'enter-distance' && (
-        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center">
-          <div className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm">
+        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm max-h-[90vh] overflow-y-auto">
             <h3 className="font-semibold text-lg mb-2">Calibration</h3>
             <p className="text-sm text-muted-foreground mb-4">Enter the real-world distance between the two points.</p>
             <input
@@ -498,8 +513,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
 
       {/* Add Node Modal */}
       {showNodeForm && draftNode && (
-        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center">
-          <form onSubmit={saveNode} className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm space-y-4">
+        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <form onSubmit={saveNode} className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm max-h-[90vh] overflow-y-auto space-y-4">
             <div className="flex justify-between items-center mb-2">
               <h3 className="font-semibold text-lg">Add Node</h3>
               <button type="button" onClick={() => { setShowNodeForm(false); setDraftNode(null); }} className="text-muted-foreground hover:text-foreground"><X size={20}/></button>
@@ -535,8 +550,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
 
       {/* Add Edge Modal */}
       {showEdgeForm && draftEdge && (
-        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center">
-          <form onSubmit={saveEdge} className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm space-y-4">
+        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <form onSubmit={saveEdge} className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm max-h-[90vh] overflow-y-auto space-y-4">
             <div className="flex justify-between items-center mb-2">
               <h3 className="font-semibold text-lg">Add Connection</h3>
               <button type="button" onClick={() => { setShowEdgeForm(false); setDraftEdge(null); }} className="text-muted-foreground hover:text-foreground"><X size={20}/></button>
