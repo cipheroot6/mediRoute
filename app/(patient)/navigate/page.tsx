@@ -1,6 +1,7 @@
 'use client'
 import { useEffect, useRef, useState, useMemo, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
+import * as THREE from 'three'
 import { astar } from '@/lib/pathfinding/astar'
 import { bearing, distanceM } from '@/lib/utils'
 import { createXRTracker } from '@/lib/ar/tracking'
@@ -32,6 +33,11 @@ function NavigateContent() {
 
   const overlayRef = useRef<HTMLDivElement>(null)
   const xrTrackerRef = useRef(createXRTracker())
+  const graphRef = useRef<Graph | null>(null)
+  const routeStateRef = useRef({ route: [] as GraphEdge[], routeIndex: 0 })
+
+  useEffect(() => { graphRef.current = graph }, [graph])
+  useEffect(() => { routeStateRef.current = { route, routeIndex } }, [route, routeIndex])
 
   // Load graph
   useEffect(() => {
@@ -104,53 +110,125 @@ function NavigateContent() {
     if (!navigator.xr || !overlayRef.current) return
 
     try {
+      const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true })
+      renderer.setPixelRatio(window.devicePixelRatio)
+      renderer.setSize(window.innerWidth, window.innerHeight)
+      renderer.xr.enabled = true
+
       const session = await navigator.xr.requestSession('immersive-ar', {
         requiredFeatures: ['dom-overlay'],
         domOverlay: { root: overlayRef.current },
       })
 
       setArSessionActive(true)
+      session.addEventListener('end', () => setArSessionActive(false))
 
-      session.addEventListener('end', () => {
-        setArSessionActive(false)
-      })
+      await renderer.xr.setSession(session as any)
 
-      // Start render loop
-      const canvas = document.createElement('canvas')
-      const gl = canvas.getContext('webgl2', { xrCompatible: true })
-      if (!gl) throw new Error('WebGL2 not supported')
-      
-      await gl.makeXRCompatible()
-      session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) })
+      const scene = new THREE.Scene()
+      const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000)
 
-      const refSpace = await session.requestReferenceSpace('local')
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.7)
+      scene.add(ambientLight)
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1)
+      dirLight.position.set(2, 10, 2)
+      scene.add(dirLight)
 
-      // Calibrate tracker with the starting anchor position
-      session.requestAnimationFrame(function firstFrame(time, xrFrame) {
-        const pose = xrFrame.getViewerPose(refSpace)
-        if (pose) {
-          xrTrackerRef.current.recalibrate(
-            { x: startX, y: startY, floor: startFloor },
-            pose
-          )
-        }
-      })
+      const arrowsGroup = new THREE.Group()
+      scene.add(arrowsGroup)
 
-      session.requestAnimationFrame(function frame(time, xrFrame) {
-        // Keep loop going if session active
-        if (session.visibilityState !== 'hidden') {
-          session.requestAnimationFrame(frame)
-        }
+      const arrows: THREE.Group[] = []
+      for (let i = 0; i < 3; i++) {
+        const arrow = new THREE.Group()
+        const material = new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.3, metalness: 0.8 })
+        
+        const shaftGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.3, 16)
+        shaftGeo.rotateX(Math.PI / 2)
+        shaftGeo.translate(0, 0, 0.15)
+        const shaft = new THREE.Mesh(shaftGeo, material)
+        
+        const headGeo = new THREE.ConeGeometry(0.12, 0.25, 16)
+        headGeo.rotateX(Math.PI / 2)
+        headGeo.translate(0, 0, 0.3 + 0.125) 
+        const head = new THREE.Mesh(headGeo, material)
+        
+        arrow.add(shaft)
+        arrow.add(head)
+        arrowsGroup.add(arrow)
+        arrows.push(arrow)
+      }
 
+      let calibrated = false
+
+      renderer.setAnimationLoop((timestamp, xrFrame) => {
+        if (!xrFrame) return
+        
+        const refSpace = renderer.xr.getReferenceSpace()
+        if (!refSpace) return
+        
         const pose = xrFrame.getViewerPose(refSpace)
         if (!pose) return
 
+        if (!calibrated) {
+          xrTrackerRef.current.recalibrate({ x: startX, y: startY, floor: startFloor }, pose)
+          calibrated = true
+        }
+
         const worldPos = xrTrackerRef.current.getWorldPosition(pose)
-        const h = xrTrackerRef.current.getHeading(pose)
+        const deviceHeading = xrTrackerRef.current.getHeading(pose)
 
         setCurrentX(worldPos.x)
         setCurrentY(worldPos.y)
-        setHeading(h)
+        setHeading(deviceHeading)
+
+        const { route: currentRoute, routeIndex: currentRouteIndex } = routeStateRef.current
+        const currentEdge = currentRoute[currentRouteIndex]
+        const nextN = currentEdge ? graphRef.current?.nodes[currentEdge.toNode] : null
+
+        if (nextN && !currentEdge?.isElevator && !currentEdge?.isStairs) {
+          arrowsGroup.visible = true
+          
+          const targetBearing = bearing(worldPos.x, worldPos.y, nextN.x, nextN.y)
+          const deviceBearingFromRight = deviceHeading - 90 
+          let angleDiff = targetBearing - deviceBearingFromRight
+          
+          while (angleDiff <= -180) angleDiff += 360
+          while (angleDiff > 180) angleDiff -= 360
+          
+          const isCorrectDir = Math.abs(angleDiff) < 45
+          const colorHex = isCorrectDir ? 0x22c55e : 0xef4444 // green-500 : red-500
+          
+          const xrCamera = renderer.xr.getCamera()
+          const camPos = new THREE.Vector3()
+          const camQuat = new THREE.Quaternion()
+          const camScale = new THREE.Vector3()
+          xrCamera.matrixWorld.decompose(camPos, camQuat, camScale)
+          
+          const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat)
+          forward.y = 0
+          forward.normalize()
+
+          const angleRad = -angleDiff * (Math.PI / 180)
+          const targetDir = forward.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), angleRad)
+
+          arrows.forEach((arrow, i) => {
+            const distance = 1.0 + i * 0.8
+            arrow.position.copy(camPos).add(forward.clone().multiplyScalar(distance))
+            arrow.position.y -= 0.6 
+            
+            arrow.children.forEach(child => {
+               if ((child as THREE.Mesh).material instanceof THREE.MeshStandardMaterial) {
+                 ((child as THREE.Mesh).material as THREE.MeshStandardMaterial).color.setHex(colorHex)
+               }
+            })
+            
+            arrow.lookAt(arrow.position.clone().sub(targetDir))
+          })
+        } else {
+          arrowsGroup.visible = false
+        }
+        
+        renderer.render(scene, camera)
       })
     } catch (err) {
       console.error('Failed to start AR session:', err)
@@ -173,13 +251,7 @@ function NavigateContent() {
     return dist
   }, [currentX, currentY, nextNode, route, routeIndex])
 
-  const arrowRotation = useMemo(() => {
-    if (!nextNode) return 0
-    const targetBearing = bearing(currentX, currentY, nextNode.x, nextNode.y)
-    // Adjust device heading from compass. Our coordinate space: 0 = right (+x).
-    const deviceBearingFromRight = heading - 90 
-    return targetBearing - deviceBearingFromRight
-  }, [nextNode, currentX, currentY, heading])
+  const arrowRotation = 0
 
   function confirmFloorTransition() {
     if (!nextNode) return
@@ -250,19 +322,7 @@ function NavigateContent() {
           </div>
         </div>
 
-        {/* Directional Arrow */}
-        {!arrived && !currentEdge?.isElevator && !currentEdge?.isStairs && (
-          <div
-            className="absolute inset-0 flex items-center justify-center pt-24"
-            style={{ transform: `rotate(${arrowRotation}deg)`, transition: 'transform 0.15s ease-out' }}
-          >
-            <div className="w-24 h-24 bg-primary/90 backdrop-blur-xl rounded-full flex items-center justify-center shadow-[0_0_40px_rgba(var(--primary),0.6)] border border-white/20">
-              <svg viewBox="0 0 24 24" className="w-12 h-12 text-white fill-current">
-                <path d="M12 2L4 14h5v8h6v-8h5z" />
-              </svg>
-            </div>
-          </div>
-        )}
+        {/* Directional Arrow Removed - Replaced with 3D Arrow */}
 
         {/* Landmarks / Voice Cues */}
         {currentEdge?.landmark && !arrived && !currentEdge?.isElevator && (
