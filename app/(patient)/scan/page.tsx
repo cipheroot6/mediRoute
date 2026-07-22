@@ -18,9 +18,7 @@ function ScanContent() {
     }
 
     // Check sessionStorage first — if we already fetched this anchor during
-    // this hospital visit, use the cached copy. Hospitals have hostile RF
-    // environments; we don't want a mid-corridor QR rescan to fail on a
-    // dropped network request.
+    // this hospital visit, use the cached copy.
     const cacheKey = `anchor:${anchorId}`
     const cached = sessionStorage.getItem(cacheKey)
 
@@ -39,18 +37,32 @@ function ScanContent() {
           setStatus('QR code not recognised.')
           return
         }
-        const url = new URL('/navigate', window.location.origin)
-        url.searchParams.set('hospitalId', data.hospitalId)
-        url.searchParams.set('startNodeId', data.nodeId)
-        // Ensure data.node is populated
-        if (data.node) {
-          url.searchParams.set('startX', data.node.x.toString())
-          url.searchParams.set('startY', data.node.y.toString())
-          url.searchParams.set('startFloor', data.node.floor.toString())
+        
+        if (dest) {
+          // Both anchor and destination are known, go straight to navigation
+          const url = new URL('/navigate', window.location.origin)
+          url.searchParams.set('hospitalId', data.hospitalId)
+          url.searchParams.set('startNodeId', data.nodeId)
+          if (data.node) {
+            url.searchParams.set('startX', data.node.x.toString())
+            url.searchParams.set('startY', data.node.y.toString())
+            url.searchParams.set('startFloor', data.node.floor.toString())
+          }
+          url.searchParams.set('dest', dest)
+          url.searchParams.set('profile', profile)
+          router.replace(url.pathname + url.search)
+        } else {
+          // No destination provided, redirect to home to select a destination
+          const homeUrl = new URL('/', window.location.origin)
+          homeUrl.searchParams.set('hospitalId', data.hospitalId)
+          homeUrl.searchParams.set('startNodeId', data.nodeId)
+          if (data.node) {
+             homeUrl.searchParams.set('startX', data.node.x.toString())
+             homeUrl.searchParams.set('startY', data.node.y.toString())
+             homeUrl.searchParams.set('startFloor', data.node.floor.toString())
+          }
+          router.replace(homeUrl.pathname + homeUrl.search)
         }
-        if (dest) url.searchParams.set('dest', dest)
-        url.searchParams.set('profile', profile)
-        router.replace(url.pathname + url.search)
       })
       .catch(() => setStatus('No signal. Try moving closer to a window.'))
   }, [anchorId, dest, profile, router])
@@ -72,3 +84,4 @@ export default function ScanPage() {
     </Suspense>
   )
 }
+

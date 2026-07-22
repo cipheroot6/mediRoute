@@ -1,6 +1,6 @@
 'use client'
-import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import type { Profile } from '@/types'
 import { createClient } from '@/lib/supabase/client'
 import { MapPin, Accessibility, Navigation, Building2, ArrowLeft, QrCode } from 'lucide-react'
@@ -10,7 +10,7 @@ type Hospital = {
   name: string
 }
 
-export default function EntryPage() {
+function EntryContent() {
   const [hospitals, setHospitals] = useState<Hospital[]>([])
   const [loadingHospitals, setLoadingHospitals] = useState(true)
   const [selectedHospital, setSelectedHospital] = useState<Hospital | null>(null)
@@ -21,6 +21,13 @@ export default function EntryPage() {
   const [results, setResults] = useState<{id: string, label: string, hospital_id: string}[]>([])
   
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const startNodeId = searchParams.get('startNodeId')
+  const startX = searchParams.get('startX')
+  const startY = searchParams.get('startY')
+  const startFloor = searchParams.get('startFloor')
+  const initialHospitalId = searchParams.get('hospitalId')
+  
   const supabase = createClient()
 
   // 1. Fetch hospitals on mount
@@ -36,8 +43,18 @@ export default function EntryPage() {
         setLoadingHospitals(false)
       }
     }
-    loadHospitals()
-  }, [supabase])
+    
+    async function loadInitialHospital() {
+      if (initialHospitalId && !selectedHospital) {
+        const { data } = await supabase.from('hospitals').select('id, name').eq('id', initialHospitalId).single()
+        if (data) setSelectedHospital(data)
+      }
+    }
+
+    loadHospitals().then(() => {
+      if (initialHospitalId) loadInitialHospital()
+    })
+  }, [supabase, initialHospitalId, selectedHospital])
 
   // 2. Fetch nodes when a hospital is selected
   useEffect(() => {
@@ -73,7 +90,21 @@ export default function EntryPage() {
   function handleSelect(nodeId: string) {
     sessionStorage.setItem('mediroute_dest', nodeId)
     sessionStorage.setItem('mediroute_profile', profile)
-    router.push(`/scan?dest=${nodeId}&profile=${profile}`)
+    
+    if (startNodeId) {
+      // We already have a start location, go straight to navigate
+      const url = new URL('/navigate', window.location.origin)
+      url.searchParams.set('hospitalId', selectedHospital!.id)
+      url.searchParams.set('startNodeId', startNodeId)
+      url.searchParams.set('startX', startX!)
+      url.searchParams.set('startY', startY!)
+      url.searchParams.set('startFloor', startFloor!)
+      url.searchParams.set('dest', nodeId)
+      url.searchParams.set('profile', profile)
+      router.push(url.pathname + url.search)
+    } else {
+      router.push(`/scan?dest=${nodeId}&profile=${profile}`)
+    }
   }
 
   return (
@@ -152,6 +183,7 @@ export default function EntryPage() {
              </div>
 
              {/* Scan QR Button */}
+             {!startNodeId && (
               <button
                 onClick={() => router.push(`/scan?profile=${profile}`)}
                 className="w-full mb-6 py-4 rounded-2xl border border-border bg-primary/10 text-primary hover:bg-primary/20 transition-all flex items-center justify-center gap-2 font-semibold"
@@ -159,6 +191,7 @@ export default function EntryPage() {
                 <QrCode size={20} />
                 Scan QR Code
               </button>
+             )}
              {/* Search bar */}
              <div className="relative mb-6">
               <input
@@ -196,5 +229,13 @@ export default function EntryPage() {
 
       </div>
     </div>
+  )
+}
+
+export default function EntryPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-background flex items-center justify-center text-muted-foreground">Loading...</div>}>
+      <EntryContent />
+    </Suspense>
   )
 }
