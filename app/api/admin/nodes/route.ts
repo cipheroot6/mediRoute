@@ -18,6 +18,16 @@ export async function POST(req: NextRequest) {
     .select()
     .single()
   if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+
+  // Automatically create a corresponding QR anchor using the node UUID
+  if (data && data.id) {
+    await supabase.from('qr_anchors').upsert({
+      anchor_id: data.id,
+      node_id: data.id,
+      hospital_id: body.hospitalId,
+    }, { onConflict: 'anchor_id' })
+  }
+
   return NextResponse.json(data)
 }
 

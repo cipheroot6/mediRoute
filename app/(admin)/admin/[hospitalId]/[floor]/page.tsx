@@ -1,9 +1,18 @@
 'use client'
 import { useState, useRef, useEffect, use } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Plus, Maximize, MousePointer2, Move, Upload, Save, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Plus, Maximize, Move, Upload, X, ZoomIn, ZoomOut, Sparkles, Trash2, Loader2 } from 'lucide-react'
+import AIReviewPanel from '@/components/admin/AIReviewPanel'
+import type { AISuggestedNode, AISuggestedEdge } from '@/app/api/admin/analyze-floor/route'
 
-type Mode = 'calibrating' | 'placing-nodes' | 'placing-edges'
+const SCALE_PRESETS = [
+  { label: 'Corridor 2.4m', value: 2.4 },
+  { label: 'Door 0.9m', value: 0.9 },
+  { label: 'Room 4m', value: 4 },
+  { label: '10m ref', value: 10 },
+]
+
+type Mode = 'calibrating' | 'placing-nodes' | 'placing-edges' | 'reviewing-ai'
 type CalibrationStep = 'point-a' | 'point-b' | 'enter-distance' | 'done'
 
 type NodeData = {
@@ -38,6 +47,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const [edges, setEdges] = useState<EdgeData[]>([])
   const [loading, setLoading] = useState(true)
   const [zoom, setZoom] = useState(1)
+  const [uploadStatus, setUploadStatus] = useState<string>('')
 
   // Calibration state
   const [calibStep, setCalibStep] = useState<CalibrationStep>('point-a')
@@ -61,6 +71,26 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const [edgeIsElevator, setEdgeIsElevator] = useState(false)
   const [edgeLandmark, setEdgeLandmark] = useState('')
 
+  // Image natural dimensions (for AI analysis)
+  const [imgW, setImgW] = useState(0)
+  const [imgH, setImgH] = useState(0)
+
+  // Node edit/delete
+  const [editingNode, setEditingNode] = useState<NodeData | null>(null)
+  const [editLabel, setEditLabel] = useState('')
+  const [editType, setEditType] = useState<NodeData['type']>('junction')
+  const [editAccessible, setEditAccessible] = useState(true)
+
+  // AI state
+  const [aiLoading, setAiLoading] = useState(false)
+  const [aiError, setAiError] = useState<string | null>(null)
+  const [aiStatusMessage, setAiStatusMessage] = useState<string>('')
+  const [pendingNodes, setPendingNodes] = useState<AISuggestedNode[]>([])
+  const [pendingEdges, setPendingEdges] = useState<AISuggestedEdge[]>([])
+  const [aiSummary, setAiSummary] = useState('')
+  const [aiWarnings, setAiWarnings] = useState<string[]>([])
+  const [aiSaving, setAiSaving] = useState(false)
+
   const imgRef = useRef<HTMLImageElement>(null)
   const supabase = createClient()
 
@@ -76,10 +106,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
         
       if (floorData) {
         setFloorPlanUrl(floorData.floor_plan_url)
-        setScaleMpp(floorData.scale_mpp)
-        if (floorData.floor_plan_url && !floorData.scale_mpp) {
-          setMode('calibrating')
-        }
+        setScaleMpp(floorData.scale_mpp || 0.05)
       } else {
         // Floor doesn't exist yet, insert it
         await supabase.from('floors').insert({
@@ -121,39 +148,126 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
       setLoading(false)
     }
     loadData()
-  }, [hospitalId, floorNumber])
+  }, [hospitalId, floorNumber, supabase])
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
     setLoading(true)
+    setUploadStatus('Reading file...')
 
-    const fileExt = file.name.split('.').pop()
-    const fileName = `${hospitalId}-${floorNumber}-${Math.random()}.${fileExt}`
+    const isPdf = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf'
 
-    const { error: uploadError } = await supabase.storage
-      .from('floor-plans')
-      .upload(fileName, file)
+    if (isPdf) {
+      try {
+        setUploadStatus('Loading multi-page PDF document...')
+        const pdfjsLib = await import('pdfjs-dist')
+        pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`
 
-    if (uploadError) {
-      alert('Upload failed: ' + uploadError.message)
+        const arrayBuffer = await file.arrayBuffer()
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+        const totalPages = pdf.numPages
+
+        let currentFloorUrl: string | null = null
+
+        for (let i = 1; i <= totalPages; i++) {
+          setUploadStatus(`Converting and uploading Floor ${i} of ${totalPages}...`)
+          const page = await pdf.getPage(i)
+          const viewport = page.getViewport({ scale: 2.0 })
+          const canvas = document.createElement('canvas')
+          const context = canvas.getContext('2d')
+          canvas.width = viewport.width
+          canvas.height = viewport.height
+
+          if (context) {
+            await page.render({ canvas, canvasContext: context, viewport }).promise
+          }
+
+          const blob: Blob = await new Promise((resolve) => {
+            canvas.toBlob((b) => resolve(b || new Blob()), 'image/png')
+          })
+
+          const fileName = `${hospitalId}-floor-${i}-${Date.now()}.png`
+          const formData = new FormData()
+          formData.append('file', blob, fileName)
+          formData.append('fileName', fileName)
+
+          const uploadRes = await fetch('/api/admin/upload', { method: 'POST', body: formData })
+          if (!uploadRes.ok) {
+            const errData = await uploadRes.json()
+            throw new Error(errData.error || `Failed to upload Floor ${i}`)
+          }
+
+          const { publicUrl } = await uploadRes.json()
+
+          if (i === floorNumber) {
+            currentFloorUrl = publicUrl
+          }
+
+          // Update or insert floor in database
+          const patchRes = await fetch('/api/admin/floors', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hospitalId, floorNumber: i, floorPlanUrl: publicUrl })
+          })
+
+          if (!patchRes.ok || (await patchRes.json()).error) {
+            await fetch('/api/admin/floors', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ hospitalId, floorNumber: i, floorPlanUrl: publicUrl })
+            })
+          }
+        }
+
+        if (currentFloorUrl) {
+          setFloorPlanUrl(currentFloorUrl)
+        } else {
+          const { data } = await supabase.from('floors').select('floor_plan_url').eq('hospital_id', hospitalId).eq('floor_number', floorNumber).single()
+          if (data?.floor_plan_url) setFloorPlanUrl(data.floor_plan_url)
+        }
+
+        if (!scaleMpp) setScaleMpp(0.05)
+        setMode('placing-nodes')
+        setUploadStatus('')
+        setLoading(false)
+        return
+      } catch (err: unknown) {
+        console.error('PDF processing error:', err)
+        alert('PDF Upload failed: ' + (err instanceof Error ? err.message : String(err)))
+        setUploadStatus('')
+        setLoading(false)
+        return
+      }
+    } else {
+      // Normal image upload via server route (Option B RLS bypass)
+      const fileExt = file.name.split('.').pop()
+      const fileName = `${hospitalId}-${floorNumber}-${Date.now()}.${fileExt}`
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('fileName', fileName)
+
+      const uploadRes = await fetch('/api/admin/upload', { method: 'POST', body: formData })
+      if (!uploadRes.ok) {
+        const errData = await uploadRes.json()
+        alert('Upload failed: ' + (errData.error || uploadRes.statusText))
+        setLoading(false)
+        return
+      }
+
+      const { publicUrl } = await uploadRes.json()
+
+      await fetch('/api/admin/floors', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hospitalId, floorNumber, floorPlanUrl: publicUrl })
+      })
+
+      setFloorPlanUrl(publicUrl)
+      if (!scaleMpp) setScaleMpp(0.05)
+      setMode('placing-nodes')
       setLoading(false)
-      return
     }
-
-    const { data: { publicUrl } } = supabase.storage
-      .from('floor-plans')
-      .getPublicUrl(fileName)
-
-    await fetch('/api/admin/floors', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hospitalId, floorNumber, floorPlanUrl: publicUrl })
-    })
-
-    setFloorPlanUrl(publicUrl)
-    setMode('calibrating')
-    setLoading(false)
   }
 
   function handleCalibrationClick(px: number, py: number) {
@@ -170,63 +284,70 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
     if (!calibPtA || !calibPtB || !realDistM) return
     const dx = calibPtB.px - calibPtA.px
     const dy = calibPtB.py - calibPtA.py
-    const pixelDist = Math.sqrt(dx * dx + dy * dy)
-    const newScaleMpp = parseFloat(realDistM) / pixelDist
-
+    const newScaleMpp = parseFloat(realDistM) / Math.sqrt(dx * dx + dy * dy)
     await fetch('/api/admin/floors', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hospitalId, floorNumber, scaleMpp: newScaleMpp })
     })
 
-    setScaleMpp(newScaleMpp)
-    setCalibStep('done')
-    setMode('placing-nodes')
+    // Automatically apply calibration scale to all other floors in this hospital so multi-floor AI can run instantly
+    try {
+      const allFloorsRes = await fetch('/api/admin/floors')
+      if (allFloorsRes.ok) {
+        const allFloors = await allFloorsRes.json()
+        for (const fl of allFloors) {
+          if (fl.hospital_id === hospitalId && fl.floor_number !== floorNumber && !fl.scale_mpp) {
+            await fetch('/api/admin/floors', {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ hospitalId, floorNumber: fl.floor_number, scaleMpp: newScaleMpp })
+            })
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to auto-apply scale to other floors:', e)
+    }
+
+    setScaleMpp(newScaleMpp); setCalibStep('done'); setMode('placing-nodes')
+    setCalibPtA(null); setCalibPtB(null); setRealDistM('')
+  }
+
+  function resetCalibration() {
+    setCalibStep('point-a'); setCalibPtA(null); setCalibPtB(null); setRealDistM('')
   }
 
   function getNodeAtPixel(px: number, py: number) {
     if (!scaleMpp) return null
-    const threshold = 15 // px
     for (const node of nodes) {
-      const nx = node.x / scaleMpp
-      const ny = node.y / scaleMpp
-      const dist = Math.sqrt(Math.pow(nx - px, 2) + Math.pow(ny - py, 2))
-      if (dist < threshold) return node
+      const nx = node.x / scaleMpp, ny = node.y / scaleMpp
+      if (Math.sqrt((nx - px) ** 2 + (ny - py) ** 2) < 15) return node
     }
     return null
   }
 
   function handleImageClick(e: React.MouseEvent<HTMLImageElement>) {
-    const rect = e.currentTarget.getBoundingClientRect()
-    // Calculate click position relative to the image's original dimensions
-    // nativeEvent.offsetX / offsetY gives coordinates relative to the rendered size.
-    // We divide by zoom to get back to the original pixels.
     const px = e.nativeEvent.offsetX / zoom
     const py = e.nativeEvent.offsetY / zoom
-
-    if (mode === 'calibrating') {
-      handleCalibrationClick(px, py)
-      return
-    }
-
+    if (mode === 'calibrating') { handleCalibrationClick(px, py); return }
     if (mode === 'placing-nodes') {
       if (!scaleMpp) return
-      const x = px * scaleMpp
-      const y = py * scaleMpp
-      setDraftNode({ px, py, x, y })
+      const existing = getNodeAtPixel(px, py)
+      if (existing) {
+        setEditingNode(existing); setEditLabel(existing.label)
+        setEditType(existing.type); setEditAccessible(existing.accessible)
+        return
+      }
+      setDraftNode({ px, py, x: px * scaleMpp, y: py * scaleMpp })
       setShowNodeForm(true)
     }
-
     if (mode === 'placing-edges') {
       const clicked = getNodeAtPixel(px, py)
       if (!clicked) return
-      if (!edgeStart) {
-        setEdgeStart(clicked)
-      } else {
-        if (edgeStart.id !== clicked.id) {
-          setDraftEdge({ from: edgeStart, to: clicked })
-          setShowEdgeForm(true)
-        }
+      if (!edgeStart) { setEdgeStart(clicked) }
+      else {
+        if (edgeStart.id !== clicked.id) { setDraftEdge({ from: edgeStart, to: clicked }); setShowEdgeForm(true) }
         setEdgeStart(null)
       }
     }
@@ -314,8 +435,256 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
     setEdgeAccessible(true)
   }
 
+  async function saveEditNode() {
+    if (!editingNode) return
+    const res = await fetch('/api/admin/nodes', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: editingNode.id, label: editLabel, type: editType, accessible: editAccessible }) })
+    if (res.ok) setNodes(nodes.map(n => n.id === editingNode.id ? { ...n, label: editLabel, type: editType, accessible: editAccessible } : n))
+    setEditingNode(null)
+  }
+
+  async function deleteNode(nodeId: string) {
+    if (!confirm('Delete this node and all its connections?')) return
+    await fetch('/api/admin/nodes', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: nodeId }) })
+    setNodes(nodes.filter(n => n.id !== nodeId))
+    setEdges(edges.filter(e => e.fromNode !== nodeId && e.toNode !== nodeId))
+    setEditingNode(null)
+  }
+
+  async function deleteEdge(edgeId: string) {
+    await fetch('/api/admin/edges', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: edgeId }) })
+    setEdges(edges.filter(e => e.id !== edgeId))
+  }
+
+  async function handleAnalyzeAI() {
+    if (!floorPlanUrl) return
+    setAiLoading(true)
+    setAiError(null)
+    try {
+      // 1. Fetch all floors for this hospital
+      const floorsRes = await fetch('/api/admin/floors')
+      const allFloorsData = await floorsRes.json()
+      const hospitalFloors = (Array.isArray(allFloorsData) ? allFloorsData : [])
+        .filter((f: any) => f.hospital_id === hospitalId && f.floor_plan_url)
+        .sort((a: any, b: any) => a.floor_number - b.floor_number)
+
+      if (hospitalFloors.length === 0) {
+        hospitalFloors.push({ hospital_id: hospitalId, floor_number: floorNumber, floor_plan_url: floorPlanUrl, scale_mpp: scaleMpp || 0.05 })
+      }
+
+      const allGeneratedNodesByFloor: Record<number, any[]> = {}
+
+      // 2. Process each floor sequentially (serial requests to AI)
+      for (let i = 0; i < hospitalFloors.length; i++) {
+        const fl = hospitalFloors[i]
+        const flNum = fl.floor_number
+        const flUrl = fl.floor_plan_url
+        const flScale = fl.scale_mpp || scaleMpp || 0.05
+
+        setAiStatusMessage(`AI is analyzing Floor ${flNum} (${i + 1} of ${hospitalFloors.length}). Reading room labels, tracing corridors, and building graph...`)
+
+        let imgWidth = imgRef.current?.naturalWidth || imgW || 1000
+        let imgHeight = imgRef.current?.naturalHeight || imgH || 1000
+
+        if (flNum !== floorNumber) {
+          const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+            const tempImg = new Image()
+            tempImg.onload = () => resolve({ w: tempImg.naturalWidth, h: tempImg.naturalHeight })
+            tempImg.onerror = () => resolve({ w: 1000, h: 1000 })
+            tempImg.src = flUrl
+          })
+          if (dims.w > 0 && dims.h > 0) {
+            imgWidth = dims.w
+            imgHeight = dims.h
+          }
+        }
+
+        const res = await fetch('/api/admin/analyze-floor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ floorPlanUrl: flUrl, scaleMpp: flScale, imageWidth: imgWidth, imageHeight: imgHeight })
+        })
+        const data = await res.json()
+        if (!res.ok) {
+          throw new Error(`Floor ${flNum} Analysis failed: ${data.error ?? 'Unknown error'}`)
+        }
+
+        setAiStatusMessage(`Saving ${data.nodes.length} waypoints and ${data.edges.length} connections for Floor ${flNum}...`)
+
+        // Clear previous nodes for this floor before saving AI structure
+        const existingNodesRes = await supabase.from('nodes').select('id').eq('hospital_id', hospitalId).eq('floor', flNum)
+        if (existingNodesRes.data && existingNodesRes.data.length > 0) {
+          for (const n of existingNodesRes.data) {
+            await fetch('/api/admin/nodes', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: n.id }) })
+          }
+        }
+
+        // Save new nodes
+        const tempIdToDbId: Record<string, string> = {}
+        const savedNodes: any[] = []
+        for (const n of data.nodes) {
+          const postNode = await fetch('/api/admin/nodes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              hospitalId,
+              floor: flNum,
+              label: n.label,
+              type: n.type,
+              x: n.x,
+              y: n.y,
+              accessible: n.accessible
+            })
+          })
+          if (postNode.ok) {
+            const saved = await postNode.json()
+            tempIdToDbId[n.tempId] = saved.id
+            savedNodes.push(saved)
+          }
+        }
+        allGeneratedNodesByFloor[flNum] = savedNodes
+
+        // Save new edges
+        for (const e of data.edges) {
+          const fromId = tempIdToDbId[e.fromTempId]
+          const toId = tempIdToDbId[e.toTempId]
+          if (!fromId || !toId) continue
+          const fn = data.nodes.find((x: any) => x.tempId === e.fromTempId)
+          const tn = data.nodes.find((x: any) => x.tempId === e.toTempId)
+          if (!fn || !tn) continue
+          const dist = Math.sqrt((tn.x - fn.x) ** 2 + (tn.y - fn.y) ** 2)
+          await fetch('/api/admin/edges', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              hospitalId,
+              fromNode: fromId,
+              toNode: toId,
+              distanceM: dist,
+              accessible: e.accessible,
+              isStairs: e.isStairs,
+              isElevator: e.isElevator,
+              landmark: null
+            })
+          })
+        }
+      }
+
+      // 3. Connect vertical circulation across adjacent floors (Elevators and Stairs)
+      if (hospitalFloors.length > 1) {
+        setAiStatusMessage('Connecting elevators and stairs across all floors...')
+        for (let i = 0; i < hospitalFloors.length - 1; i++) {
+          const f1Num = hospitalFloors[i].floor_number
+          const f2Num = hospitalFloors[i + 1].floor_number
+          const f1Nodes = allGeneratedNodesByFloor[f1Num] || []
+          const f2Nodes = allGeneratedNodesByFloor[f2Num] || []
+
+          const f1Elevators = f1Nodes.filter((n: any) => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
+          const f2Elevators = f2Nodes.filter((n: any) => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
+
+          for (const el1 of f1Elevators) {
+            const el2 = f2Elevators[0]
+            if (el2) {
+              await fetch('/api/admin/edges', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  hospitalId,
+                  fromNode: el1.id,
+                  toNode: el2.id,
+                  distanceM: 5,
+                  accessible: true,
+                  isStairs: false,
+                  isElevator: true,
+                  landmark: `Elevator connection Floor ${f1Num} to ${f2Num}`
+                })
+              })
+            }
+          }
+
+          const f1Stairs = f1Nodes.filter((n: any) => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
+          const f2Stairs = f2Nodes.filter((n: any) => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
+
+          for (const st1 of f1Stairs) {
+            const st2 = f2Stairs[0]
+            if (st2) {
+              await fetch('/api/admin/edges', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  hospitalId,
+                  fromNode: st1.id,
+                  toNode: st2.id,
+                  distanceM: 8,
+                  accessible: false,
+                  isStairs: true,
+                  isElevator: false,
+                  landmark: `Stairs Floor ${f1Num} to ${f2Num}`
+                })
+              })
+            }
+          }
+        }
+      }
+
+      // 4. Reload local state for the currently displayed floor
+      const [{ data: nData }, { data: eData }] = await Promise.all([
+        supabase.from('nodes').select('*').eq('hospital_id', hospitalId).eq('floor', floorNumber),
+        supabase.from('edges').select('*').eq('hospital_id', hospitalId)
+      ])
+      if (nData) {
+        setNodes(nData.map((n: any) => ({ id: n.id, label: n.label, type: n.type, x: n.x, y: n.y, accessible: n.accessible })))
+      }
+      if (eData) {
+        setEdges(eData.map((e: any) => ({
+          id: e.id,
+          fromNode: e.from_node,
+          toNode: e.to_node,
+          distanceM: e.distance_m,
+          accessible: e.accessible,
+          isStairs: e.is_stairs,
+          isElevator: e.is_elevator,
+          landmark: e.landmark
+        })))
+      }
+
+      setAiStatusMessage('')
+      setMode('placing-nodes')
+      alert(`AI Analysis complete! Successfully analyzed and linked all ${hospitalFloors.length} floor(s).`)
+    } catch (err: unknown) {
+      setAiError(err instanceof Error ? err.message : 'AI analysis failed')
+    } finally {
+      setAiLoading(false)
+    }
+  }
+
+  async function confirmAISuggestions() {
+    setAiSaving(true)
+    try {
+      const idMap: Record<string, string> = {}
+      for (const n of pendingNodes) {
+        const res = await fetch('/api/admin/nodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hospitalId, floor: floorNumber, label: n.label, type: n.type, x: n.x, y: n.y, accessible: n.accessible }) })
+        if (res.ok) { const d = await res.json(); idMap[n.tempId] = d.id; setNodes(prev => [...prev, { id: d.id, label: d.label, type: d.type, x: d.x, y: d.y, accessible: d.accessible }]) }
+      }
+      for (const e of pendingEdges) {
+        const fromId = idMap[e.fromTempId], toId = idMap[e.toTempId]
+        if (!fromId || !toId) continue
+        const fn = pendingNodes.find(n => n.tempId === e.fromTempId), tn = pendingNodes.find(n => n.tempId === e.toTempId)
+        if (!fn || !tn) continue
+        const dist = Math.sqrt((tn.x - fn.x) ** 2 + (tn.y - fn.y) ** 2)
+        const res = await fetch('/api/admin/edges', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hospitalId, fromNode: fromId, toNode: toId, distanceM: dist, accessible: e.accessible, isStairs: e.isStairs, isElevator: e.isElevator, landmark: null }) })
+        if (res.ok) { const d = await res.json(); setEdges(prev => [...prev, { id: d.id, fromNode: d.from_node, toNode: d.to_node, distanceM: d.distance_m, accessible: d.accessible, isStairs: d.is_stairs, isElevator: d.is_elevator, landmark: d.landmark }]) }
+      }
+      setPendingNodes([]); setPendingEdges([]); setMode('placing-nodes')
+    } finally { setAiSaving(false) }
+  }
+
   if (loading) {
-    return <div className="min-h-screen flex items-center justify-center bg-background"><p>Loading...</p></div>
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background gap-3">
+        <Loader2 size={32} className="animate-spin text-primary" />
+        <p className="text-muted-foreground font-medium">{uploadStatus || 'Loading...'}</p>
+      </div>
+    )
   }
 
   if (!floorPlanUrl) {
@@ -323,19 +692,16 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
       <div className="min-h-screen bg-background p-8 flex items-center justify-center">
         <div className="max-w-md w-full p-8 border border-border bg-black/40 rounded-2xl text-center space-y-4">
           <Upload className="mx-auto text-muted-foreground w-12 h-12" />
-          <h2 className="text-xl font-medium">Upload Floor Plan</h2>
-          <p className="text-muted-foreground text-sm">Upload a PNG or JPG of Floor {floorNumber}.</p>
+          <h2 className="text-xl font-medium">Upload Floor Plan or PDF</h2>
+          <p className="text-muted-foreground text-sm">Upload an image or multi-floor PDF for Floor {floorNumber}. Multi-page PDFs will automatically import all floors sequentially.</p>
           <label className="block bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 rounded-md font-medium cursor-pointer transition-colors">
             Select File
-            <input type="file" className="hidden" accept="image/*" onChange={handleUpload} />
+            <input type="file" className="hidden" accept="image/*,.pdf,application/pdf" onChange={handleUpload} />
           </label>
         </div>
       </div>
     )
   }
-
-  // To display bidirectional edges smoothly (since graph creates reverse edge virtually, but DB only has one row),
-  // we just draw all edges from the `edges` state directly.
 
   return (
     <div className="min-h-screen bg-background flex flex-col h-screen overflow-hidden">
@@ -345,30 +711,31 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           <h1 className="font-medium text-lg">Hospital {hospitalId} <span className="text-muted-foreground mx-2">/</span> Floor {floorNumber}</h1>
         </div>
         <div className="flex flex-wrap gap-2">
-          {!scaleMpp && (
-            <div className="px-3 py-1 bg-yellow-500/10 text-yellow-500 text-sm font-medium rounded-full border border-yellow-500/20">
-              Calibration Required
-            </div>
-          )}
           <button
-            onClick={() => setMode('calibrating')}
+            onClick={() => { setMode('calibrating'); resetCalibration() }}
             className={`px-4 py-2 rounded-md text-sm font-medium flex items-center transition-colors ${mode === 'calibrating' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent hover:text-accent-foreground'}`}
           >
-            <Maximize size={16} className="mr-2" /> Calibrate
+            <Maximize size={16} className="mr-2" /> {scaleMpp ? 'Re-Calibrate' : 'Calibrate'}
           </button>
           <button
             onClick={() => setMode('placing-nodes')}
-            disabled={!scaleMpp}
-            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${mode === 'placing-nodes' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent hover:text-accent-foreground'}`}
+            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center transition-colors ${mode === 'placing-nodes' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent hover:text-accent-foreground'}`}
           >
             <Plus size={16} className="mr-2" /> Nodes
           </button>
           <button
             onClick={() => { setMode('placing-edges'); setEdgeStart(null); }}
-            disabled={!scaleMpp}
-            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${mode === 'placing-edges' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent hover:text-accent-foreground'}`}
+            className={`px-4 py-2 rounded-md text-sm font-medium flex items-center transition-colors ${mode === 'placing-edges' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent hover:text-accent-foreground'}`}
           >
             <Move size={16} className="mr-2" /> Edges
+          </button>
+          <button
+            onClick={handleAnalyzeAI}
+            disabled={aiLoading || mode === 'reviewing-ai'}
+            className="px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {aiLoading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+            {aiLoading ? 'Analyzing Floors…' : 'Analyze All Floors with AI'}
           </button>
           
           <div className="flex items-center gap-1 border-l border-border/50 pl-2 ml-2">
@@ -391,15 +758,17 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           {mode === 'calibrating' && calibStep === 'point-a' && 'Click a point to start calibration'}
           {mode === 'calibrating' && calibStep === 'point-b' && 'Click a second point to measure'}
           {mode === 'calibrating' && calibStep === 'enter-distance' && 'Enter the real-world distance'}
-          {mode === 'placing-nodes' && 'Click on the map to add a node'}
+          {mode === 'placing-nodes' && 'Click map to add · click existing node to edit/delete'}
           {mode === 'placing-edges' && !edgeStart && 'Click a node to start edge'}
           {mode === 'placing-edges' && edgeStart && 'Click another node to connect'}
+          {mode === 'reviewing-ai' && 'Review AI suggestions in the panel →'}
         </div>
 
         <div className="relative inline-block border border-border/50 shadow-2xl bg-black rounded-lg overflow-hidden">
           <img
             src={floorPlanUrl}
             onClick={handleImageClick}
+            onLoad={e => { const img = e.currentTarget; setImgW(img.naturalWidth); setImgH(img.naturalHeight) }}
             className={`block max-w-none ${mode === 'calibrating' ? 'cursor-crosshair' : mode === 'placing-nodes' ? 'cursor-cell' : 'cursor-pointer'}`}
             draggable={false}
             ref={imgRef}
@@ -419,9 +788,6 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
               const from = nodes.find(n => n.id === edge.fromNode)
               const to = nodes.find(n => n.id === edge.toNode)
               if (!from || !to || !scaleMpp) return null
-              // Only draw edges where at least one node is on this floor.
-              // In this view, we're assuming both nodes are on this floor (except elevators).
-              // For a true cross-floor view, we'd need more logic, but this is fine for same-floor.
               return (
                 <line
                   key={edge.id}
@@ -432,6 +798,14 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
                   strokeDasharray={edge.isElevator || edge.isStairs ? '6 4' : undefined}
                 />
               )
+            })}
+
+            {/* Pending AI edges */}
+            {mode === 'reviewing-ai' && pendingEdges.map(edge => {
+              const from = pendingNodes.find(n => n.tempId === edge.fromTempId)
+              const to   = pendingNodes.find(n => n.tempId === edge.toTempId)
+              if (!from || !to || !scaleMpp) return null
+              return <line key={edge.tempId} x1={from.x/scaleMpp} y1={from.y/scaleMpp} x2={to.x/scaleMpp} y2={to.y/scaleMpp} stroke="#818cf8" strokeWidth={2} strokeDasharray="6 3" opacity={0.7} />
             })}
             
             {/* Active Edge Drawing */}
@@ -446,8 +820,10 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
               const isDest = node.type === 'destination'
               const isJunction = node.type === 'junction'
               const color = isDest ? '#10b981' : isEntry ? '#a855f7' : isJunction ? '#6366f1' : '#f59e0b'
+              const isEditing = editingNode?.id === node.id
               return (
                 <g key={node.id}>
+                  {isEditing && <circle cx={node.x / scaleMpp} cy={node.y / scaleMpp} r={14} fill="none" stroke="#fff" strokeWidth={2} strokeDasharray="3 2" />}
                   <circle
                     cx={node.x / scaleMpp}
                     cy={node.y / scaleMpp}
@@ -466,6 +842,18 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
                   >
                     {node.label}
                   </text>
+                </g>
+              )
+            })}
+
+            {/* Pending AI nodes */}
+            {mode === 'reviewing-ai' && pendingNodes.map(node => {
+              if (!scaleMpp) return null
+              const color = node.type==='destination' ? '#10b981' : node.type==='entry' ? '#a855f7' : node.type==='junction' ? '#818cf8' : '#f59e0b'
+              return (
+                <g key={node.tempId}>
+                  <circle cx={node.x/scaleMpp} cy={node.y/scaleMpp} r={8} fill={color} stroke="#fff" strokeWidth={2} opacity={0.85} />
+                  <text x={node.x/scaleMpp} y={(node.y/scaleMpp)-12} textAnchor="middle" fill="#a5b4fc" className="text-[10px]" style={{ textShadow: '0 1px 3px black' }}>{node.label}</text>
                 </g>
               )
             })}
@@ -492,20 +880,35 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
       {/* Calibration Distance Input */}
       {mode === 'calibrating' && calibStep === 'enter-distance' && (
         <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm max-h-[90vh] overflow-y-auto">
+          <div className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm max-h-[90vh] overflow-y-auto space-y-4">
             <h3 className="font-semibold text-lg mb-2">Calibration</h3>
-            <p className="text-sm text-muted-foreground mb-4">Enter the real-world distance between the two points.</p>
-            <input
-              type="number"
-              placeholder="Distance in meters (e.g. 10)"
-              value={realDistM}
-              onChange={e => setRealDistM(e.target.value)}
-              className="flex h-10 w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary mb-4"
-              autoFocus
-            />
+            <p className="text-sm text-muted-foreground">Enter the real-world distance between the two points.</p>
+            <div>
+              <p className="text-xs text-muted-foreground mb-2">Quick picks:</p>
+              <div className="flex flex-wrap gap-2">
+                {SCALE_PRESETS.map(p => (
+                  <button key={p.label} onClick={() => setRealDistM(String(p.value))} className={`px-3 py-1 rounded-full text-xs border transition-colors ${realDistM === String(p.value) ? 'bg-primary text-primary-foreground border-primary' : 'border-border hover:border-primary/50 hover:bg-white/5'}`}>{p.label}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <input
+                type="number"
+                placeholder="Distance in meters (e.g. 10)"
+                value={realDistM}
+                onChange={e => setRealDistM(e.target.value)}
+                className="flex h-10 w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                autoFocus
+              />
+              {realDistM && calibPtA && calibPtB && (() => {
+                const dx = calibPtB.px - calibPtA.px, dy = calibPtB.py - calibPtA.py
+                const mpp = parseFloat(realDistM) / Math.sqrt(dx*dx + dy*dy)
+                return <p className="text-xs text-muted-foreground mt-1">Scale: 1 px = {mpp.toFixed(4)} m &nbsp;·&nbsp; 1 m ≈ {Math.round(1/mpp)} px</p>
+              })()}
+            </div>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setCalibStep('point-a')} className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground">Reset</button>
-              <button onClick={confirmCalibration} className="px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium">Confirm</button>
+              <button onClick={resetCalibration} className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground">Reset</button>
+              <button onClick={confirmCalibration} disabled={!realDistM} className="px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium disabled:opacity-50">Confirm</button>
             </div>
           </div>
         </div>
@@ -583,6 +986,87 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
               Save Connection
             </button>
           </form>
+        </div>
+      )}
+
+      {/* Node edit/delete modal */}
+      {editingNode && (
+        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-background border border-border p-6 rounded-2xl w-full max-w-sm max-h-[90vh] overflow-y-auto space-y-4">
+            <div className="flex justify-between items-center">
+              <h3 className="font-semibold text-lg">Edit Node</h3>
+              <button onClick={() => setEditingNode(null)}><X size={20} /></button>
+            </div>
+            <div>
+              <label className="text-sm font-medium mb-1 block">Label</label>
+              <input type="text" value={editLabel} onChange={e => setEditLabel(e.target.value)} autoFocus className="flex h-10 w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+            </div>
+            <div>
+              <label className="text-sm font-medium mb-1 block">Type</label>
+              <select value={editType} onChange={e => setEditType(e.target.value as NodeData['type'])} className="flex h-10 w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none">
+                {(['junction','destination','entry','elevator','stairs'] as const).map(t => <option key={t} value={t} className="bg-background capitalize">{t}</option>)}
+              </select>
+            </div>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={editAccessible} onChange={e => setEditAccessible(e.target.checked)} />
+              <span className="text-sm">Wheelchair Accessible</span>
+            </label>
+            {edges.filter(e => e.fromNode === editingNode.id || e.toNode === editingNode.id).length > 0 && (
+              <div className="border-t border-border pt-3">
+                <p className="text-xs text-muted-foreground mb-2">Connected edges:</p>
+                {edges.filter(e => e.fromNode === editingNode.id || e.toNode === editingNode.id).map(edge => {
+                  const otherId = edge.fromNode === editingNode.id ? edge.toNode : edge.fromNode
+                  const other = nodes.find(n => n.id === otherId)
+                  return (
+                    <div key={edge.id} className="flex items-center justify-between py-1">
+                      <span className="text-xs text-muted-foreground">→ {other?.label ?? '?'} ({edge.distanceM.toFixed(1)}m)</span>
+                      <button onClick={() => deleteEdge(edge.id)} className="text-red-400 hover:text-red-300 p-1"><Trash2 size={12} /></button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            <div className="flex gap-2 justify-between pt-2">
+              <button onClick={() => deleteNode(editingNode.id)} className="flex items-center gap-1 px-3 py-2 text-sm text-red-400 hover:text-red-300 border border-red-400/30 rounded-md">
+                <Trash2 size={14} /> Delete Node
+              </button>
+              <button onClick={saveEditNode} className="px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI loading overlay */}
+      {aiLoading && (
+        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm z-50 flex flex-col items-center justify-center gap-4 p-6 text-center">
+          <Loader2 size={40} className="animate-spin text-indigo-400" />
+          <p className="text-lg font-medium">{aiStatusMessage || 'Analyzing floor plans with AI…'}</p>
+          <p className="text-sm text-muted-foreground max-w-sm">AI is reading room labels, tracing corridors, building the navigation graph, and linking multi-floor elevator paths. Please wait...</p>
+        </div>
+      )}
+
+      {/* AI error toast */}
+      {aiError && (
+        <div className="absolute bottom-20 left-1/2 -translate-x-1/2 bg-red-900/80 border border-red-500/50 px-4 py-3 rounded-lg text-sm text-red-200 z-30 flex items-center gap-3 max-w-md">
+          <span>{aiError}</span>
+          <button onClick={() => setAiError(null)} className="underline shrink-0">dismiss</button>
+        </div>
+      )}
+
+      {/* AI review panel */}
+      {mode === 'reviewing-ai' && (
+        <div className="absolute inset-y-16 right-0 z-30 shadow-2xl">
+          <AIReviewPanel
+            nodes={pendingNodes}
+            edges={pendingEdges}
+            summary={aiSummary}
+            warnings={aiWarnings}
+            saving={aiSaving}
+            onNodesChange={setPendingNodes}
+            onEdgesChange={setPendingEdges}
+            onConfirm={confirmAISuggestions}
+            onDiscard={() => { setPendingNodes([]); setPendingEdges([]); setMode('placing-nodes') }}
+          />
         </div>
       )}
     </div>
