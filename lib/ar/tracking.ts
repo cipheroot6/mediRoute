@@ -11,6 +11,8 @@ export type XRTracker = {
   getWorldPosition: (currentPose: XRViewerPose) => XRPosition
   // Heading in degrees (0 = +X axis of floor plan)
   getHeading: (currentPose: XRViewerPose) => number
+  // Convert 2D map coordinates to 3D XR physical coordinates on the floor plane
+  getXRPosition: (mapPos: { x: number; y: number }, currentPose: XRViewerPose, targetY?: number) => { x: number; y: number; z: number }
 }
 
 export function createXRTracker(): XRTracker {
@@ -59,6 +61,22 @@ export function createXRTracker(): XRTracker {
         1 - 2 * (q.y * q.y + q.z * q.z)
       )
       return yaw * (180 / Math.PI)
+    },
+
+    getXRPosition(mapPos, currentPose, targetY = 0) {
+      if (!poseOrigin) return { x: 0, y: 0, z: -2 }
+      
+      const mapDx = mapPos.x - worldOrigin.x
+      const mapDy = mapPos.y - worldOrigin.y
+      
+      const dx_xr = mapDx * Math.cos(trackingTheta) + mapDy * Math.sin(trackingTheta)
+      const dz_xr = -mapDx * Math.sin(trackingTheta) + mapDy * Math.cos(trackingTheta)
+      
+      return {
+        x: poseOrigin.x + dx_xr,
+        y: targetY, // Directly assigned ground elevation plane in XR coordinate space
+        z: poseOrigin.z + dz_xr,
+      }
     },
   }
 }

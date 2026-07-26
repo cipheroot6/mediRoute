@@ -3,7 +3,7 @@ import { createAdminClient } from '@/lib/supabase/server'
 
 // Simple in-memory cache per hospitalId — graph rarely changes
 const cache: Record<string, { graph: Graph; loadedAt: number }> = {}
-const CACHE_TTL_MS = 60_000 // 1 minute
+const CACHE_TTL_MS = 5_000 // 5 seconds — keeps rapid rerenders efficient but never serves stale AI-generated graphs
 
 export async function loadGraph(hospitalId: string): Promise<Graph> {
   const cached = cache[hospitalId]
@@ -13,10 +13,19 @@ export async function loadGraph(hospitalId: string): Promise<Graph> {
 
   const supabase = createAdminClient()
 
-  const [{ data: rawNodes }, { data: rawEdges }] = await Promise.all([
+  const [{ data: rawNodes }, { data: rawEdges }, { data: rawFloors }] = await Promise.all([
     supabase.from('nodes').select('*').eq('hospital_id', hospitalId),
     supabase.from('edges').select('*').eq('hospital_id', hospitalId),
+    supabase.from('floors').select('*').eq('hospital_id', hospitalId),
   ])
+
+  const floors: Record<number, { floorPlanUrl: string | null; scaleMpp: number }> = {}
+  for (const f of rawFloors ?? []) {
+    floors[f.floor_number] = {
+      floorPlanUrl: f.floor_plan_url || null,
+      scaleMpp: f.scale_mpp || 0.05,
+    }
+  }
 
   const nodes: Record<string, GraphNode> = {}
   for (const n of rawNodes ?? []) {
@@ -52,7 +61,7 @@ export async function loadGraph(hospitalId: string): Promise<Graph> {
     edges.push({ ...base, id: `${e.id}_rev`, fromNode: e.to_node, toNode: e.from_node, landmark: null })
   }
 
-  const graph: Graph = { nodes, edges }
+  const graph: Graph = { nodes, edges, floors }
   cache[hospitalId] = { graph, loadedAt: Date.now() }
   return graph
 }

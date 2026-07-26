@@ -28,6 +28,7 @@ export type GraphEdge = {
 export type Graph = {
   nodes: Record<string, GraphNode>
   edges: GraphEdge[]
+  floors?: Record<number, { floorPlanUrl: string | null; scaleMpp: number }>
 }
 
 export type QRAnchor = {

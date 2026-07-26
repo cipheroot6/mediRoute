@@ -6,9 +6,10 @@ import { astar } from '@/lib/pathfinding/astar'
 import { bearing, distanceM } from '@/lib/utils'
 import { createXRTracker } from '@/lib/ar/tracking'
 import { speakCue } from '@/lib/voice/speech'
+import { NODE_ARRIVAL_THRESHOLD_M } from '@/lib/constants'
+import { NavDashboard } from '@/components/patient/NavDashboard'
+import { NavMiniMap } from '@/components/patient/NavMiniMap'
 import type { Graph, GraphEdge, Profile } from '@/types'
-
-const NODE_ARRIVAL_THRESHOLD_M = 3 // 3 meters to consider arrived at a node
 
 function NavigateContent() {
   const params = useSearchParams()
@@ -30,6 +31,7 @@ function NavigateContent() {
   const [arSessionActive, setArSessionActive] = useState(false)
   const [arrived, setArrived] = useState(false)
   const [heading, setHeading] = useState(0)
+  const [routeError, setRouteError] = useState<string | null>(null)
 
   const overlayRef = useRef<HTMLDivElement>(null)
   const xrTrackerRef = useRef(createXRTracker())
@@ -43,28 +45,34 @@ function NavigateContent() {
   useEffect(() => {
     if (!hospitalId || !startNodeId || !destNodeId) return
 
-    const cacheKey = `graph:${hospitalId}`
-    const cached = sessionStorage.getItem(cacheKey)
+    // Always fetch fresh — sessionStorage cache can be stale after AI re-analysis
+    fetch(`/api/hospital/${hospitalId}/graph`)
+      .then(r => r.json())
+      .then((g: Graph) => {
+        setGraph(g)
+        const nodeCount = Object.keys(g.nodes).length
+        const startExists = !!g.nodes[startNodeId]
+        const destExists = !!g.nodes[destNodeId]
 
-    const resolveGraph: Promise<Graph> = cached
-      ? Promise.resolve(JSON.parse(cached))
-      : fetch(`/api/hospital/${hospitalId}/graph`)
-          .then(r => r.json())
-          .then(g => {
-            sessionStorage.setItem(cacheKey, JSON.stringify(g))
-            return g
-          })
+        if (!startExists || !destExists) {
+          console.error(`[Nav] startNode=${startNodeId} exists=${startExists}, destNode=${destNodeId} exists=${destExists}, total nodes=${nodeCount}`)
+          setRouteError(`Navigation node not found in graph. Start: ${startExists}, Dest: ${destExists}. Try re-scanning the QR code.`)
+          return
+        }
 
-    resolveGraph.then((g: Graph) => {
-      setGraph(g)
-      const edges = astar(g, startNodeId, destNodeId, profile)
-      setRoute(edges ?? [])
-      
-      const destNode = g.nodes[destNodeId]
-      if (destNode && edges && edges.length > 0) {
-        speakCue(`Navigating to ${destNode.label}. Route found.`)
-      }
-    })
+        const edges = astar(g, startNodeId, destNodeId, profile)
+        if (!edges || edges.length === 0) {
+          setRouteError(`No path found between your location and ${g.nodes[destNodeId]?.label ?? 'destination'}. The map may not have a connected route yet.`)
+          return
+        }
+        setRoute(edges)
+        const destNode = g.nodes[destNodeId]
+        if (destNode) speakCue(`Navigating to ${destNode.label}. Route found.`)
+      })
+      .catch(err => {
+        console.error('[Nav] graph load error:', err)
+        setRouteError('Failed to load navigation map. Please check your connection.')
+      })
   }, [hospitalId, startNodeId, destNodeId, profile])
 
   // Check WebXR support
@@ -114,11 +122,11 @@ function NavigateContent() {
       renderer.setPixelRatio(window.devicePixelRatio)
       renderer.setSize(window.innerWidth, window.innerHeight)
       renderer.xr.enabled = true
-      renderer.xr.setReferenceSpaceType('local')
+      renderer.xr.setReferenceSpaceType('local-floor')
 
       const session = await navigator.xr.requestSession('immersive-ar', {
         requiredFeatures: ['dom-overlay'],
-        optionalFeatures: ['local'],
+        optionalFeatures: ['local-floor', 'bounded-floor', 'local'],
         domOverlay: { root: overlayRef.current },
       })
 
@@ -139,6 +147,51 @@ function NavigateContent() {
       const arrowsGroup = new THREE.Group()
       scene.add(arrowsGroup)
 
+      const pathGroup = new THREE.Group()
+      scene.add(pathGroup)
+
+      // Pre-allocate object pool for Google Maps style blue floor walking pathway
+      const basePlaneGeo = new THREE.PlaneGeometry(0.55, 1)
+      basePlaneGeo.rotateX(-Math.PI / 2)
+      const pathMat = new THREE.MeshPhysicalMaterial({
+        color: 0x0088ff,
+        emissive: 0x0066cc,
+        emissiveIntensity: 0.8,
+        transparent: true,
+        opacity: 0.7,
+        roughness: 0.2,
+        metalness: 0.1,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+
+      const nodeGeo = new THREE.CircleGeometry(0.28, 32)
+      nodeGeo.rotateX(-Math.PI / 2)
+      const nodeMat = new THREE.MeshPhysicalMaterial({
+        color: 0x00d8ff,
+        emissive: 0x00a8ff,
+        emissiveIntensity: 0.9,
+        transparent: true,
+        opacity: 0.85,
+        roughness: 0.2,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+
+      const pathSegmentPool: THREE.Mesh[] = []
+      const pathNodePool: THREE.Mesh[] = []
+      for (let i = 0; i < 25; i++) {
+        const segMesh = new THREE.Mesh(basePlaneGeo, pathMat)
+        segMesh.visible = false
+        pathGroup.add(segMesh)
+        pathSegmentPool.push(segMesh)
+
+        const circleMesh = new THREE.Mesh(nodeGeo, nodeMat)
+        circleMesh.visible = false
+        pathGroup.add(circleMesh)
+        pathNodePool.push(circleMesh)
+      }
+
       // Create a single sleek glowing chevron, scaled down to fit the screen
       const shape = new THREE.Shape()
       shape.moveTo(0, 0.15)
@@ -150,8 +203,9 @@ function NavigateContent() {
       const extrudeSettings = { depth: 0.02, bevelEnabled: true, bevelSegments: 2, steps: 1, bevelSize: 0.01, bevelThickness: 0.01 }
       const arrowGeo = new THREE.ExtrudeGeometry(shape, extrudeSettings)
       
-      // Rotate so it lays flat on the floor, pointing towards -Z
+      // Rotate so it lays flat on the floor, pointing sharp tip precisely towards local -Z
       arrowGeo.rotateX(-Math.PI / 2)
+      arrowGeo.rotateY(Math.PI)
 
       const arrowMat = new THREE.MeshPhysicalMaterial({
         color: 0x22c55e,
@@ -206,14 +260,53 @@ function NavigateContent() {
         const currentEdge = currentRoute[currentRouteIndex]
         const nextN = currentEdge ? graphRef.current?.nodes[currentEdge.toNode] : null
 
+        // Extract live camera world matrix to establish dynamic ground elevation plane
+        const xrCamera = renderer.xr.getCamera()
+        const camPos = new THREE.Vector3()
+        const camQuat = new THREE.Quaternion()
+        const camScale = new THREE.Vector3()
+        xrCamera.matrixWorld.decompose(camPos, camQuat, camScale)
+
+        // In 'local-floor', ARCore vision algorithms set real floor surface precisely at Y = 0.
+        // In 'local' fallback space (where camera starts near Y = 0), physical floor is approx 1.4m below eye level.
+        const groundY = camPos.y > 0.7 ? 0 : camPos.y - 1.4
+
+        // Update glowing blue walking path directly on physical floor
+        for (let i = 0; i < pathSegmentPool.length; i++) pathSegmentPool[i].visible = false
+        for (let i = 0; i < pathNodePool.length; i++) pathNodePool[i].visible = false
+
+        if (currentRoute && currentRoute.length > 0 && graphRef.current) {
+          const mapPoints: { x: number; y: number }[] = [{ x: worldPos.x, y: worldPos.y }]
+          for (let i = currentRouteIndex; i < currentRoute.length; i++) {
+            const edge = currentRoute[i]
+            if (edge.isElevator || edge.isStairs) break
+            const targetNode = graphRef.current.nodes[edge.toNode]
+            if (!targetNode || targetNode.floor !== worldPos.floor) break
+            mapPoints.push({ x: targetNode.x, y: targetNode.y })
+          }
+
+          const xrPoints = mapPoints.map(pt => xrTrackerRef.current.getXRPosition(pt, pose, groundY))
+          for (let i = 0; i < xrPoints.length - 1 && i < pathSegmentPool.length; i++) {
+            const p1 = xrPoints[i]
+            const p2 = xrPoints[i + 1]
+            const dist = Math.sqrt((p2.x - p1.x) ** 2 + (p2.z - p1.z) ** 2)
+            if (dist > 0.05) {
+              const segMesh = pathSegmentPool[i]
+              segMesh.position.set((p1.x + p2.x) / 2, groundY, (p1.z + p2.z) / 2)
+              segMesh.lookAt(p2.x, groundY, p2.z)
+              segMesh.scale.set(1, 1, dist)
+              segMesh.visible = true
+            }
+            if (i < pathNodePool.length) {
+              const circleMesh = pathNodePool[i]
+              circleMesh.position.set(p2.x, groundY + 0.005, p2.z)
+              circleMesh.visible = true
+            }
+          }
+        }
+
         if (nextN && !currentEdge?.isElevator && !currentEdge?.isStairs) {
           arrowsGroup.visible = true
-          
-          const xrCamera = renderer.xr.getCamera()
-          const camPos = new THREE.Vector3()
-          const camQuat = new THREE.Quaternion()
-          const camScale = new THREE.Vector3()
-          xrCamera.matrixWorld.decompose(camPos, camQuat, camScale)
           
           // Current camera forward direction
           const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat)
@@ -221,9 +314,9 @@ function NavigateContent() {
           if (forward.lengthSq() > 0.001) forward.normalize()
           else forward.set(0, 0, -1)
 
-          // Vector pointing directly to the target node in XR space
-          // We keep this vector for the color logic since it perfectly solved the color issue.
-          const targetVec = new THREE.Vector3(worldPos.x - nextN.x, 0, worldPos.y - nextN.y)
+          // Compute true XR coordinates of target node on the ground plane so arrow and path align perfectly
+          const targetXR = xrTrackerRef.current.getXRPosition({ x: nextN.x, y: nextN.y }, pose, groundY)
+          const targetVec = new THREE.Vector3(targetXR.x - camPos.x, 0, targetXR.z - camPos.z)
           if (targetVec.lengthSq() > 0.001) targetVec.normalize()
           else targetVec.set(0, 0, -1)
           
@@ -232,19 +325,18 @@ function NavigateContent() {
           
           const isCorrectDir = angleRad < (45 * Math.PI / 180)
           
-          // Un-swapped colors: Green ONLY when facing the exact correct direction, Red otherwise.
-          const colorHex = isCorrectDir ? 0x22c55e : 0xef4444 // Green if true, Red if false
+          // Green when facing generally towards destination, Red if off-track
+          const colorHex = isCorrectDir ? 0x22c55e : 0xef4444
           
-          // Position the single sleek arrow 1.2m in front of the camera, slightly lower
+          // Position the chevron arrow 1.2m in front of the camera, slightly lower at eye/chest level
           arrowMesh.position.copy(camPos).add(forward.clone().multiplyScalar(1.2))
           arrowMesh.position.y -= 0.5
           
           arrowMat.color.setHex(colorHex)
           arrowMat.emissive.setHex(colorHex)
           
-          // Point the arrow exactly opposite to targetVec to fix the visual direction 
-          // (making it point West as requested) without breaking the color logic.
-          arrowMesh.lookAt(arrowMesh.position.clone().sub(targetVec))
+          // Point arrow tip straight along targetVec (synchronized with the blue floor path)
+          arrowMesh.lookAt(arrowMesh.position.x + targetVec.x, arrowMesh.position.y, arrowMesh.position.z + targetVec.z)
 
         } else {
           arrowsGroup.visible = false
@@ -299,6 +391,16 @@ function NavigateContent() {
     return <div className="min-h-screen bg-background flex items-center justify-center">Checking device compatibility...</div>
   }
 
+  if (routeError) {
+    return (
+      <div className="min-h-screen bg-background p-8 flex flex-col items-center justify-center text-center">
+        <h2 className="text-xl font-bold mb-4 text-red-400">Navigation Error</h2>
+        <p className="text-muted-foreground mb-4">{routeError}</p>
+        <button onClick={() => window.location.href = '/'} className="px-6 py-3 bg-primary text-primary-foreground rounded-xl font-semibold">Go Back</button>
+      </div>
+    )
+  }
+
   if (xrSupported === false) {
     return (
       <div className="min-h-screen bg-background p-8 flex flex-col items-center justify-center text-center">
@@ -331,26 +433,40 @@ function NavigateContent() {
         ref={overlayRef} 
         className="fixed inset-0 pointer-events-none"
       >
+        {arSessionActive && graph && route.length > 0 && (
+          <>
+            <NavDashboard
+              graph={graph}
+              route={route}
+              routeIndex={routeIndex}
+              currentX={currentX}
+              currentY={currentY}
+              currentFloor={currentFloor}
+              remainingDistM={remainingDistM}
+              destinationLabel={destNode?.label}
+              profile={profile}
+              arrived={arrived}
+            />
+            <NavMiniMap
+              graph={graph}
+              route={route}
+              routeIndex={routeIndex}
+              currentX={currentX}
+              currentY={currentY}
+              currentFloor={currentFloor}
+              arrived={arrived}
+            />
+          </>
+        )}
+
         {arSessionActive && (
           <>
-            {/* Top HUD */}
-            <div className="absolute top-0 left-0 right-0 bg-gradient-to-b from-black/80 to-transparent pt-12 pb-8 px-6 flex items-start justify-between pointer-events-none">
-              <div>
-                <p className="text-sm text-white/70 font-medium">Navigating to</p>
-                <p className="font-bold text-xl text-white tracking-tight">{destNode?.label}</p>
-              </div>
-              <div className="text-right bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-xl border border-white/10">
-                <p className="text-xs text-white/70 font-medium">Floor {currentFloor}</p>
-                <p className="font-bold text-lg text-white">{Math.round(remainingDistM)}m</p>
-              </div>
-            </div>
-
             {/* Landmarks / Voice Cues */}
             {currentEdge?.landmark && !arrived && !currentEdge?.isElevator && (
-              <div className="absolute bottom-12 left-6 right-6">
-                <div className="bg-black/80 backdrop-blur-xl text-white rounded-2xl px-6 py-5 border border-white/10 shadow-2xl">
-                  <p className="text-sm text-white/70 font-medium mb-1">Next instruction</p>
-                  <p className="font-semibold text-lg">{currentEdge.landmark}</p>
+              <div className="absolute bottom-6 left-4 right-44 max-w-md z-30 pointer-events-none">
+                <div className="bg-black/85 backdrop-blur-xl text-white rounded-2xl px-5 py-4 border border-white/10 shadow-2xl pointer-events-auto">
+                  <p className="text-xs text-white/70 font-medium mb-1 uppercase tracking-wider">Next landmark</p>
+                  <p className="font-semibold text-base truncate">📍 {currentEdge.landmark}</p>
                 </div>
               </div>
             )}
@@ -390,13 +506,6 @@ function NavigateContent() {
                     Done
                   </button>
                 </div>
-              </div>
-            )}
-
-            {/* Wheelchair Accessible Badge */}
-            {profile === 'wheelchair' && (
-              <div className="absolute top-24 left-6 bg-blue-500/20 text-blue-400 border border-blue-500/30 text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-1.5 shadow-lg">
-                ♿ Accessible Route
               </div>
             )}
           </>
