@@ -1,5 +1,5 @@
 'use client'
-import { useState, useMemo } from 'react'
+import { useState } from 'react'
 import { X, Sparkles, AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Trash2, Loader2 } from 'lucide-react'
 import type { AISuggestedNode, AISuggestedEdge } from '@/app/api/admin/analyze-floor/route'
 

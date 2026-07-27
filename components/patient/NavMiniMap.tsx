@@ -93,6 +93,7 @@ export function NavMiniMap({
         onClick={() => setExpanded(e => !e)}
         className="w-full h-full relative cursor-pointer flex items-center justify-center bg-slate-950 overflow-hidden"
       >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={floorPlanUrl}
           alt={`Floor ${currentFloor} Map`}

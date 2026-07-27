@@ -17,7 +17,7 @@ export async function loadGraph(hospitalId: string): Promise<Graph> {
     supabase.from('nodes').select('*').eq('hospital_id', hospitalId),
     supabase.from('edges').select('*').eq('hospital_id', hospitalId),
     supabase.from('floors').select('*').eq('hospital_id', hospitalId),
-    supabase.from('qr_anchors').select('id, node_id').eq('hospital_id', hospitalId),
+    supabase.from('qr_anchors').select('anchor_id, node_id').eq('hospital_id', hospitalId),
   ])
 
   const floors: Record<number, { floorPlanUrl: string | null; scaleMpp: number }> = {}
@@ -65,7 +65,7 @@ export async function loadGraph(hospitalId: string): Promise<Graph> {
   // Build nodeId → anchorId map for proximity re-anchoring in the navigation UI
   const anchors: Record<string, string> = {}
   for (const a of rawAnchors ?? []) {
-    anchors[a.node_id] = a.id
+    anchors[a.node_id] = a.anchor_id
   }
 
   const graph: Graph = { nodes, edges, floors, anchors }

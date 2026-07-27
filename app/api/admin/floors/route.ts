@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
   const supabase = createAdminClient()
   
   // Convert frontend camelCase to database snake_case
-  const insertData: Record<string, any> = {
+  const insertData: Record<string, unknown> = {
     hospital_id: body.hospitalId,
     floor_number: body.floorNumber,
   }
@@ -36,7 +36,7 @@ export async function PATCH(req: NextRequest) {
   const { hospitalId, floorNumber, floorPlanUrl, scaleMpp, ...rest } = body
   
   // Convert frontend camelCase to database snake_case
-  const updateFields: Record<string, any> = { ...rest }
+  const updateFields: Record<string, unknown> = { ...rest }
   if (floorPlanUrl !== undefined) updateFields.floor_plan_url = floorPlanUrl
   if (scaleMpp !== undefined) updateFields.scale_mpp = scaleMpp
 

@@ -1,4 +1,5 @@
 import type { Graph, GraphEdge, GraphNode, Profile } from '@/types'
+import { ELEVATOR_FLOOR_PENALTY } from '@/lib/constants'
 
 type NodeId = string
 
@@ -6,7 +7,7 @@ function heuristic(a: GraphNode, b: GraphNode): number {
   // Euclidean distance in metres + a floor-change penalty
   const dx = a.x - b.x
   const dy = a.y - b.y
-  const floorPenalty = Math.abs(a.floor - b.floor) * 50
+  const floorPenalty = Math.abs(a.floor - b.floor) * ELEVATOR_FLOOR_PENALTY
   return Math.sqrt(dx * dx + dy * dy) + floorPenalty
 }
 

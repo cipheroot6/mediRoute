@@ -147,6 +147,7 @@ export default function QRSheetPage({ params }: { params: Promise<{ hospitalId: 
               {anchors.map(a => (
                 <div key={a.anchor_id} className="border border-border/80 p-4 rounded-xl flex flex-col items-center bg-zinc-900/40 backdrop-blur print:border-gray-300 print:bg-white print:rounded-lg print:break-inside-avoid shadow-sm hover:border-indigo-500/40 transition-all">
                   <div className="bg-white p-2 rounded-lg shadow-inner print:shadow-none print:p-0">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img src={a.qr_data_url} alt={`QR for ${a.node_label}`} className="w-36 h-36 object-contain" />
                   </div>
                   <p className="mt-3 font-semibold text-center text-sm text-foreground print:text-black leading-tight">{a.node_label}</p>

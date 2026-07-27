@@ -9,13 +9,10 @@ function ScanContent() {
   const anchorId = params.get('a')
   const dest = params.get('dest')
   const profile = params.get('profile') ?? 'standard'
-  const [status, setStatus] = useState('Locating you...')
+  const [status, setStatus] = useState(anchorId ? 'Locating you...' : 'Invalid QR code.')
 
   useEffect(() => {
-    if (!anchorId) {
-      setStatus('Invalid QR code.')
-      return
-    }
+    if (!anchorId) return
 
     // Check sessionStorage first — if we already fetched this anchor during
     // this hospital visit, use the cached copy.
@@ -24,7 +21,7 @@ function ScanContent() {
 
     const resolveAnchor = cached
       ? Promise.resolve(JSON.parse(cached))
-      : fetch(`/api/anchor/${anchorId}`)
+      : fetch(`/api/anchor/${anchorId}`, { signal: AbortSignal.timeout(10_000) })
           .then(r => r.json())
           .then(data => {
             if (!data.error) sessionStorage.setItem(cacheKey, JSON.stringify(data))

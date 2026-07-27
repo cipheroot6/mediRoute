@@ -61,13 +61,12 @@ function EntryContent() {
     if (!selectedHospital) return
     
     async function loadNodes() {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from('nodes')
         .select('id, label, hospital_id')
         .eq('hospital_id', selectedHospital!.id)
         .eq('type', 'destination')
         
-      console.log('Fetched nodes:', data, 'Error:', error)
       if (data) {
         setAllNodes(data)
         setResults(data.slice(0, 5))

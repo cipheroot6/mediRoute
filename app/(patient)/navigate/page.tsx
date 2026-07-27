@@ -14,7 +14,7 @@ import {
 } from '@/lib/constants'
 import { NavDashboard } from '@/components/patient/NavDashboard'
 import { NavMiniMap } from '@/components/patient/NavMiniMap'
-import type { Graph, GraphEdge, GraphNode, Profile } from '@/types'
+import type { Graph, GraphEdge, GraphNode, Profile, WebkitDeviceOrientationEvent } from '@/types'
 import { Compass, Sparkles, Navigation2, RefreshCw, Layers, ChevronUp, ChevronDown } from 'lucide-react'
 
 function NavigateContent() {
@@ -54,6 +54,18 @@ function NavigateContent() {
 
   const calibrationRequestRef = useRef(false)
   const recalibrateToNodeRef = useRef<string | null>(null)
+  const activeRendererRef = useRef<THREE.WebGLRenderer | null>(null)
+
+  useEffect(() => {
+    const imu = imuTrackerRef.current
+    return () => {
+      if (activeRendererRef.current) {
+        activeRendererRef.current.setAnimationLoop(null)
+        activeRendererRef.current.dispose()
+      }
+      imu.stop()
+    }
+  }, [])
 
   useEffect(() => { graphRef.current = graph }, [graph])
   useEffect(() => { routeStateRef.current = { route, routeIndex } }, [route, routeIndex])
@@ -61,9 +73,10 @@ function NavigateContent() {
   // Improvement #2: Listen to DeviceOrientation for magnetic compass bearing on Android Chrome
   useEffect(() => {
     function handleOrientation(event: DeviceOrientationEvent) {
+      const webkitEvent = event as WebkitDeviceOrientationEvent
       let deg: number | null = null
-      if (typeof (event as any).webkitCompassHeading === 'number') {
-        deg = (event as any).webkitCompassHeading
+      if (typeof webkitEvent.webkitCompassHeading === 'number') {
+        deg = webkitEvent.webkitCompassHeading
       } else if (event.absolute && typeof event.alpha === 'number') {
         // Absolute orientation on Android: 360 - alpha gives CW degrees from magnetic North
         deg = (360 - event.alpha) % 360
@@ -77,10 +90,10 @@ function NavigateContent() {
       }
     }
 
-    window.addEventListener('deviceorientationabsolute' as any, handleOrientation)
+    window.addEventListener('deviceorientationabsolute' as keyof WindowEventMap, handleOrientation as EventListener)
     window.addEventListener('deviceorientation', handleOrientation)
     return () => {
-      window.removeEventListener('deviceorientationabsolute' as any, handleOrientation)
+      window.removeEventListener('deviceorientationabsolute' as keyof WindowEventMap, handleOrientation as EventListener)
       window.removeEventListener('deviceorientation', handleOrientation)
     }
   }, [])
@@ -121,7 +134,7 @@ function NavigateContent() {
     if (typeof navigator !== 'undefined' && navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(setXrSupported)
     } else {
-      setXrSupported(false)
+      Promise.resolve().then(() => setXrSupported(false))
     }
   }, [])
 
@@ -146,14 +159,16 @@ function NavigateContent() {
 
     if (dist < threshold) {
       if (routeIndex === route.length - 1) {
-        setArrived(true)
+        Promise.resolve().then(() => setArrived(true))
         speakCue('You have arrived at your destination.')
         imuTrackerRef.current.stop()
       } else {
-        setCurrentX(nextNode.x)
-        setCurrentY(nextNode.y)
-        setCurrentFloor(nextNode.floor)
-        setRouteIndex(i => i + 1)
+        Promise.resolve().then(() => {
+          setCurrentX(nextNode.x)
+          setCurrentY(nextNode.y)
+          setCurrentFloor(nextNode.floor)
+          setRouteIndex(i => i + 1)
+        })
         const nextEdge = route[routeIndex + 1]
         if (nextEdge?.landmark) {
           speakCue(`Continue, then ${nextEdge.landmark}`)
@@ -165,7 +180,7 @@ function NavigateContent() {
     if (graph.anchors) {
       let bestNodeId: string | null = null
       let minDist = REANCHOR_PROXIMITY_M
-      for (const [nodeId, _anchorId] of Object.entries(graph.anchors)) {
+      for (const nodeId of Object.keys(graph.anchors)) {
         // Skip start node right after leaving it unless we walked far away and returned
         if (nodeId === startNodeId && routeIndex < 2) continue
         const n = graph.nodes[nodeId]
@@ -177,7 +192,7 @@ function NavigateContent() {
           }
         }
       }
-      setProximityAnchorNodeId(bestNodeId)
+      Promise.resolve().then(() => setProximityAnchorNodeId(bestNodeId))
     }
   }, [currentX, currentY, currentFloor, routeIndex, route, graph, arrived, isTrackerCalibrated, startNodeId])
 
@@ -204,7 +219,8 @@ function NavigateContent() {
         imuTrackerRef.current.stop()
       })
 
-      await renderer.xr.setSession(session as any)
+      activeRendererRef.current = renderer
+      await (renderer.xr as { setSession: (s: unknown) => Promise<void> }).setSession(session)
 
       const scene = new THREE.Scene()
       const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000)
@@ -772,7 +788,7 @@ function NavigateContent() {
                     onClick={confirmFloorTransition}
                     className="w-full bg-primary text-primary-foreground font-semibold py-4 rounded-xl shadow-lg active:scale-95 transition-transform"
                   >
-                    I'm on Floor {nextNode?.floor}
+                    I&apos;m on Floor {nextNode?.floor}
                   </button>
                 </div>
               </div>

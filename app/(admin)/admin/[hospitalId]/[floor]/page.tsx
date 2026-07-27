@@ -4,6 +4,7 @@ import { createClient } from '@/lib/supabase/client'
 import { Plus, Maximize, Move, Upload, X, ZoomIn, ZoomOut, Sparkles, Trash2, Loader2 } from 'lucide-react'
 import AIReviewPanel from '@/components/admin/AIReviewPanel'
 import type { AISuggestedNode, AISuggestedEdge } from '@/app/api/admin/analyze-floor/route'
+import { NODE_HIT_THRESHOLD_PX } from '@/lib/constants'
 
 const SCALE_PRESETS = [
   { label: 'Corridor 2.4m', value: 2.4 },
@@ -87,8 +88,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const [aiStatusMessage, setAiStatusMessage] = useState<string>('')
   const [pendingNodes, setPendingNodes] = useState<AISuggestedNode[]>([])
   const [pendingEdges, setPendingEdges] = useState<AISuggestedEdge[]>([])
-  const [aiSummary, setAiSummary] = useState('')
-  const [aiWarnings, setAiWarnings] = useState<string[]>([])
+  const [aiSummary] = useState('')
+  const [aiWarnings] = useState<string[]>([])
   const [aiSaving, setAiSaving] = useState(false)
 
   const imgRef = useRef<HTMLImageElement>(null)
@@ -323,7 +324,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
     if (!scaleMpp) return null
     for (const node of nodes) {
       const nx = node.x / scaleMpp, ny = node.y / scaleMpp
-      if (Math.sqrt((nx - px) ** 2 + (ny - py) ** 2) < 15) return node
+      if (Math.sqrt((nx - px) ** 2 + (ny - py) ** 2) < NODE_HIT_THRESHOLD_PX) return node
     }
     return null
   }
@@ -463,22 +464,22 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
     try {
       // 1. Fetch all floors for this hospital
       const floorsRes = await fetch('/api/admin/floors')
-      const allFloorsData = await floorsRes.json()
+      const allFloorsData: { hospital_id: string; floor_number: number; floor_plan_url?: string; scale_mpp?: number }[] = await floorsRes.json()
       const hospitalFloors = (Array.isArray(allFloorsData) ? allFloorsData : [])
-        .filter((f: any) => f.hospital_id === hospitalId && f.floor_plan_url)
-        .sort((a: any, b: any) => a.floor_number - b.floor_number)
+        .filter(f => f.hospital_id === hospitalId && f.floor_plan_url)
+        .sort((a, b) => a.floor_number - b.floor_number)
 
       if (hospitalFloors.length === 0) {
         hospitalFloors.push({ hospital_id: hospitalId, floor_number: floorNumber, floor_plan_url: floorPlanUrl, scale_mpp: scaleMpp || 0.05 })
       }
 
-      const allGeneratedNodesByFloor: Record<number, any[]> = {}
+      const allGeneratedNodesByFloor: Record<number, { id: string; label: string; type: string }[]> = {}
 
       // 2. Process each floor sequentially (serial requests to AI)
       for (let i = 0; i < hospitalFloors.length; i++) {
         const fl = hospitalFloors[i]
         const flNum = fl.floor_number
-        const flUrl = fl.floor_plan_url
+        const flUrl = fl.floor_plan_url || ''
         const flScale = fl.scale_mpp || scaleMpp || 0.05
 
         setAiStatusMessage(`AI is analyzing Floor ${flNum} (${i + 1} of ${hospitalFloors.length}). Reading room labels, tracing corridors, and building graph...`)
@@ -521,7 +522,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
 
         // Save new nodes
         const tempIdToDbId: Record<string, string> = {}
-        const savedNodes: any[] = []
+        const savedNodes: { id: string; label: string; type: string }[] = []
         for (const n of data.nodes) {
           const postNode = await fetch('/api/admin/nodes', {
             method: 'POST',
@@ -549,8 +550,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           const fromId = tempIdToDbId[e.fromTempId]
           const toId = tempIdToDbId[e.toTempId]
           if (!fromId || !toId) continue
-          const fn = data.nodes.find((x: any) => x.tempId === e.fromTempId)
-          const tn = data.nodes.find((x: any) => x.tempId === e.toTempId)
+          const fn = data.nodes.find((x: { tempId: string; x: number; y: number }) => x.tempId === e.fromTempId)
+          const tn = data.nodes.find((x: { tempId: string; x: number; y: number }) => x.tempId === e.toTempId)
           if (!fn || !tn) continue
           const dist = Math.sqrt((tn.x - fn.x) ** 2 + (tn.y - fn.y) ** 2)
           await fetch('/api/admin/edges', {
@@ -579,8 +580,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           const f1Nodes = allGeneratedNodesByFloor[f1Num] || []
           const f2Nodes = allGeneratedNodesByFloor[f2Num] || []
 
-          const f1Elevators = f1Nodes.filter((n: any) => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
-          const f2Elevators = f2Nodes.filter((n: any) => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
+          const f1Elevators = f1Nodes.filter(n => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
+          const f2Elevators = f2Nodes.filter(n => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
 
           for (const el1 of f1Elevators) {
             const el2 = f2Elevators[0]
@@ -602,8 +603,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
             }
           }
 
-          const f1Stairs = f1Nodes.filter((n: any) => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
-          const f2Stairs = f2Nodes.filter((n: any) => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
+          const f1Stairs = f1Nodes.filter(n => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
+          const f2Stairs = f2Nodes.filter(n => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
 
           for (const st1 of f1Stairs) {
             const st2 = f2Stairs[0]
@@ -633,18 +634,18 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
         supabase.from('edges').select('*').eq('hospital_id', hospitalId)
       ])
       if (nData) {
-        setNodes(nData.map((n: any) => ({ id: n.id, label: n.label, type: n.type, x: n.x, y: n.y, accessible: n.accessible })))
+        setNodes(nData.map((n: { id: string; label: string; type: NodeData['type']; x: number; y: number; accessible: boolean }) => ({ id: n.id, label: n.label, type: n.type, x: n.x, y: n.y, accessible: n.accessible })))
       }
       if (eData) {
-        setEdges(eData.map((e: any) => ({
+        setEdges(eData.map((e: { id: string; from_node: string; to_node: string; distance_m: number; accessible: boolean; is_stairs?: boolean; is_elevator?: boolean; landmark?: string }) => ({
           id: e.id,
           fromNode: e.from_node,
           toNode: e.to_node,
           distanceM: e.distance_m,
           accessible: e.accessible,
-          isStairs: e.is_stairs,
-          isElevator: e.is_elevator,
-          landmark: e.landmark
+          isStairs: Boolean(e.is_stairs),
+          isElevator: Boolean(e.is_elevator),
+          landmark: e.landmark ?? null
         })))
       }
 
@@ -766,22 +767,24 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
         </div>
 
         <div className="relative inline-block border border-border/50 shadow-2xl bg-black rounded-lg overflow-hidden">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={floorPlanUrl}
+            alt="Floor plan map"
             onClick={handleImageClick}
             onLoad={e => { const img = e.currentTarget; setImgW(img.naturalWidth); setImgH(img.naturalHeight) }}
             className={`block max-w-none ${mode === 'calibrating' ? 'cursor-crosshair' : mode === 'placing-nodes' ? 'cursor-cell' : 'cursor-pointer'}`}
             draggable={false}
             ref={imgRef}
-            style={{ width: imgRef.current?.naturalWidth ? imgRef.current.naturalWidth * zoom : undefined }}
+            style={{ width: imgW ? imgW * zoom : undefined }}
           />
           
           <svg
             className="absolute inset-0 pointer-events-none"
-            viewBox={`0 0 ${imgRef.current?.naturalWidth || 0} ${imgRef.current?.naturalHeight || 0}`}
+            viewBox={`0 0 ${imgW || 0} ${imgH || 0}`}
             style={{ 
-              width: imgRef.current?.naturalWidth ? imgRef.current.naturalWidth * zoom : undefined, 
-              height: imgRef.current?.naturalHeight ? imgRef.current.naturalHeight * zoom : undefined 
+              width: imgW ? imgW * zoom : undefined, 
+              height: imgH ? imgH * zoom : undefined 
             }}
           >
             {/* Draw Edges */}

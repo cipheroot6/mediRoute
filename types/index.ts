@@ -65,3 +65,8 @@ export type NavigationState = {
   destinationNodeId: string
   profile: Profile
 }
+
+// Extension for iOS / Chrome device orientation compass events
+export interface WebkitDeviceOrientationEvent extends DeviceOrientationEvent {
+  webkitCompassHeading?: number
+}

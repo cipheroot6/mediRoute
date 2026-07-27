@@ -12,6 +12,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Missing file or fileName in form data' }, { status: 400 })
     }
 
+    const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024 // 10MB limit
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      return NextResponse.json({ error: 'File exceeds maximum size limit of 10MB' }, { status: 400 })
+    }
+
+    const allowedMimes = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'application/pdf']
+    if (!allowedMimes.includes(file.type)) {
+      return NextResponse.json({ error: `Unsupported file format: ${file.type}` }, { status: 400 })
+    }
+
     const supabase = createAdminClient()
 
     const arrayBuffer = await file.arrayBuffer()

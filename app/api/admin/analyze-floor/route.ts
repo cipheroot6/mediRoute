@@ -162,6 +162,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Missing required fields: floorPlanUrl, scaleMpp, imageWidth, imageHeight' }, { status: 400 })
   }
 
+  try {
+    const urlObj = new URL(floorPlanUrl)
+    const blockedHosts = ['localhost', '127.0.0.1', '0.0.0.0', '169.254.169.254', '::1']
+    if (blockedHosts.includes(urlObj.hostname) || urlObj.hostname.startsWith('10.') || urlObj.hostname.startsWith('192.168.')) {
+      return NextResponse.json({ error: 'Invalid or unauthorized floorPlanUrl host' }, { status: 400 })
+    }
+  } catch {
+    return NextResponse.json({ error: 'Invalid URL syntax for floorPlanUrl' }, { status: 400 })
+  }
+
   // Fetch floor plan image and convert to base64
   let base64Image: string
   try {
@@ -196,7 +206,7 @@ ${JSON.stringify(RESPONSE_SCHEMA, null, 2)}`
     }
   }
 
-  let ollamaData: any
+  let ollamaData: { message?: { content?: string } } | null = null
   try {
     const aiRes = await fetch('https://ollama.com/api/chat', {
       method: 'POST',
@@ -217,7 +227,7 @@ ${JSON.stringify(RESPONSE_SCHEMA, null, 2)}`
     return NextResponse.json({ error: `Ollama Cloud request failed: ${e}` }, { status: 502 })
   }
 
-  let rawText = ollamaData?.message?.content
+  const rawText = ollamaData?.message?.content
   if (!rawText) {
     return NextResponse.json({ error: 'Empty or unexpected response from Ollama Cloud.' }, { status: 502 })
   }

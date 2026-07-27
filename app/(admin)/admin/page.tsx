@@ -1,6 +1,5 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { Building2, Plus, ArrowRight, QrCode } from 'lucide-react'
 
@@ -16,8 +15,6 @@ export default function AdminDashboard() {
   const [name, setName] = useState('')
   const [floors, setFloors] = useState(1)
   const [submitting, setSubmitting] = useState(false)
-  
-  const router = useRouter()
 
   useEffect(() => {
     fetch('/api/admin/hospitals')

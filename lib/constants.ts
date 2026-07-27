@@ -27,3 +27,11 @@ export const IMU_STEP_LENGTH_M = 0.75
 
 // Proximity re-anchor — show recalibration banner when this close to an anchor node
 export const REANCHOR_PROXIMITY_M = 4.0
+
+// Voice navigation speech synthesis default parameters
+export const SPEECH_RATE = 0.95
+export const SPEECH_PITCH = 1
+export const SPEECH_VOLUME = 1
+
+// Admin interactive floor map editor click hit-detection distance threshold (px)
+export const NODE_HIT_THRESHOLD_PX = 15
