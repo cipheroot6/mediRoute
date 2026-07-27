@@ -12,6 +12,7 @@ export interface NavMiniMapProps {
   currentY: number
   currentFloor: number
   arrived?: boolean
+  heading?: number
 }
 
 export function NavMiniMap({
@@ -22,6 +23,7 @@ export function NavMiniMap({
   currentY,
   currentFloor,
   arrived = false,
+  heading = 0,
 }: NavMiniMapProps) {
   const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null)
   const [expanded, setExpanded] = useState(false)
@@ -130,7 +132,10 @@ export function NavMiniMap({
           <div className="absolute w-6 h-6 bg-blue-500/30 rounded-full animate-ping" />
           {/* Blue Position Indicator */}
           <div className="relative w-3.5 h-3.5 bg-blue-500 rounded-full border-[2.5px] border-white shadow-[0_0_10px_#3b82f6] flex items-center justify-center">
-            <Navigation2 className="w-2 h-2 text-white stroke-[3] rotate-45" />
+            <Navigation2 
+              className="w-2 h-2 text-white stroke-[3] transition-transform duration-150" 
+              style={{ transform: `rotate(${(heading ?? 0) + 45}deg)` }} 
+            />
           </div>
         </div>
       </div>

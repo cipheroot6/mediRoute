@@ -29,6 +29,8 @@ export type Graph = {
   nodes: Record<string, GraphNode>
   edges: GraphEdge[]
   floors?: Record<number, { floorPlanUrl: string | null; scaleMpp: number }>
+  /** nodeId → anchorId: nodes that have a physical QR sticker placed at them */
+  anchors?: Record<string, string>
 }
 
 export type QRAnchor = {

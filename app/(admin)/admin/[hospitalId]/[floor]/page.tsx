@@ -108,10 +108,11 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
         setFloorPlanUrl(floorData.floor_plan_url)
         setScaleMpp(floorData.scale_mpp || 0.05)
       } else {
-        // Floor doesn't exist yet, insert it
-        await supabase.from('floors').insert({
-          hospital_id: hospitalId,
-          floor_number: floorNumber
+        // Floor doesn't exist yet, insert via secure admin route
+        await fetch('/api/admin/floors', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hospitalId, floorNumber })
         })
       }
 

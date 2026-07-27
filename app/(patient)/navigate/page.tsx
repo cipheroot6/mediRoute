@@ -3,13 +3,19 @@ import { useEffect, useRef, useState, useMemo, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import * as THREE from 'three'
 import { astar } from '@/lib/pathfinding/astar'
-import { bearing, distanceM } from '@/lib/utils'
-import { createXRTracker } from '@/lib/ar/tracking'
+import { distanceM } from '@/lib/utils'
+import { createXRTracker, snapToPath } from '@/lib/ar/tracking'
+import { createIMUTracker } from '@/lib/ar/imu'
 import { speakCue } from '@/lib/voice/speech'
-import { NODE_ARRIVAL_THRESHOLD_M } from '@/lib/constants'
+import {
+  NODE_ARRIVAL_THRESHOLD_WAYPOINT_M,
+  NODE_ARRIVAL_THRESHOLD_DEST_M,
+  REANCHOR_PROXIMITY_M,
+} from '@/lib/constants'
 import { NavDashboard } from '@/components/patient/NavDashboard'
 import { NavMiniMap } from '@/components/patient/NavMiniMap'
-import type { Graph, GraphEdge, Profile } from '@/types'
+import type { Graph, GraphEdge, GraphNode, Profile } from '@/types'
+import { Compass, Sparkles, Navigation2, RefreshCw, Layers, ChevronUp, ChevronDown } from 'lucide-react'
 
 function NavigateContent() {
   const params = useSearchParams()
@@ -33,29 +39,64 @@ function NavigateContent() {
   const [heading, setHeading] = useState(0)
   const [routeError, setRouteError] = useState<string | null>(null)
 
+  // Improvement #3: Deferred calibration state
+  const [isTrackerCalibrated, setIsTrackerCalibrated] = useState(false)
+  // Improvement #4 & #9: Proximity re-anchoring & floor prompt state
+  const [proximityAnchorNodeId, setProximityAnchorNodeId] = useState<string | null>(null)
+  const [needsFloorRecalibration, setNeedsFloorRecalibration] = useState(false)
+  const [compassHeading, setCompassHeading] = useState<number | null>(null)
+
   const overlayRef = useRef<HTMLDivElement>(null)
   const xrTrackerRef = useRef(createXRTracker())
+  const imuTrackerRef = useRef(createIMUTracker())
   const graphRef = useRef<Graph | null>(null)
   const routeStateRef = useRef({ route: [] as GraphEdge[], routeIndex: 0 })
 
+  const calibrationRequestRef = useRef(false)
+  const recalibrateToNodeRef = useRef<string | null>(null)
+
   useEffect(() => { graphRef.current = graph }, [graph])
   useEffect(() => { routeStateRef.current = { route, routeIndex } }, [route, routeIndex])
+
+  // Improvement #2: Listen to DeviceOrientation for magnetic compass bearing on Android Chrome
+  useEffect(() => {
+    function handleOrientation(event: DeviceOrientationEvent) {
+      let deg: number | null = null
+      if (typeof (event as any).webkitCompassHeading === 'number') {
+        deg = (event as any).webkitCompassHeading
+      } else if (event.absolute && typeof event.alpha === 'number') {
+        // Absolute orientation on Android: 360 - alpha gives CW degrees from magnetic North
+        deg = (360 - event.alpha) % 360
+      }
+      if (deg !== null && !isNaN(deg)) {
+        setCompassHeading(deg)
+        xrTrackerRef.current.setCompassHeading(deg)
+        if (imuTrackerRef.current.active) {
+          imuTrackerRef.current.setHeading(deg)
+        }
+      }
+    }
+
+    window.addEventListener('deviceorientationabsolute' as any, handleOrientation)
+    window.addEventListener('deviceorientation', handleOrientation)
+    return () => {
+      window.removeEventListener('deviceorientationabsolute' as any, handleOrientation)
+      window.removeEventListener('deviceorientation', handleOrientation)
+    }
+  }, [])
 
   // Load graph
   useEffect(() => {
     if (!hospitalId || !startNodeId || !destNodeId) return
 
-    // Always fetch fresh — sessionStorage cache can be stale after AI re-analysis
     fetch(`/api/hospital/${hospitalId}/graph`)
       .then(r => r.json())
       .then((g: Graph) => {
         setGraph(g)
-        const nodeCount = Object.keys(g.nodes).length
         const startExists = !!g.nodes[startNodeId]
         const destExists = !!g.nodes[destNodeId]
 
         if (!startExists || !destExists) {
-          console.error(`[Nav] startNode=${startNodeId} exists=${startExists}, destNode=${destNodeId} exists=${destExists}, total nodes=${nodeCount}`)
           setRouteError(`Navigation node not found in graph. Start: ${startExists}, Dest: ${destExists}. Try re-scanning the QR code.`)
           return
         }
@@ -84,9 +125,9 @@ function NavigateContent() {
     }
   }, [])
 
-  // Node arrival detection
+  // Improvement #7 & #4: Node arrival detection (adaptive thresholds) & Proximity anchor detection
   useEffect(() => {
-    if (!graph || route.length === 0 || arrived) return
+    if (!graph || route.length === 0 || arrived || !isTrackerCalibrated) return
     const currentEdge = route[routeIndex]
     if (!currentEdge) return
 
@@ -97,10 +138,17 @@ function NavigateContent() {
     if (nextNode.floor !== currentFloor) return
 
     const dist = distanceM(currentX, currentY, nextNode.x, nextNode.y)
-    if (dist < NODE_ARRIVAL_THRESHOLD_M) {
+    
+    // Improvement #7: Use 1.5m threshold for waypoints, 3.0m for final destination
+    const threshold = routeIndex === route.length - 1
+      ? NODE_ARRIVAL_THRESHOLD_DEST_M
+      : NODE_ARRIVAL_THRESHOLD_WAYPOINT_M
+
+    if (dist < threshold) {
       if (routeIndex === route.length - 1) {
         setArrived(true)
         speakCue('You have arrived at your destination.')
+        imuTrackerRef.current.stop()
       } else {
         setCurrentX(nextNode.x)
         setCurrentY(nextNode.y)
@@ -112,7 +160,26 @@ function NavigateContent() {
         }
       }
     }
-  }, [currentX, currentY, currentFloor, routeIndex, route, graph, arrived])
+
+    // Improvement #4: Proximity re-anchoring detection
+    if (graph.anchors) {
+      let bestNodeId: string | null = null
+      let minDist = REANCHOR_PROXIMITY_M
+      for (const [nodeId, _anchorId] of Object.entries(graph.anchors)) {
+        // Skip start node right after leaving it unless we walked far away and returned
+        if (nodeId === startNodeId && routeIndex < 2) continue
+        const n = graph.nodes[nodeId]
+        if (n && n.floor === currentFloor) {
+          const d = distanceM(currentX, currentY, n.x, n.y)
+          if (d < minDist) {
+            minDist = d
+            bestNodeId = nodeId
+          }
+        }
+      }
+      setProximityAnchorNodeId(bestNodeId)
+    }
+  }, [currentX, currentY, currentFloor, routeIndex, route, graph, arrived, isTrackerCalibrated, startNodeId])
 
   async function startAR() {
     if (!navigator.xr || !overlayRef.current) return
@@ -131,7 +198,11 @@ function NavigateContent() {
       })
 
       setArSessionActive(true)
-      session.addEventListener('end', () => setArSessionActive(false))
+      session.addEventListener('end', () => {
+        setArSessionActive(false)
+        setIsTrackerCalibrated(false)
+        imuTrackerRef.current.stop()
+      })
 
       await renderer.xr.setSession(session as any)
 
@@ -150,7 +221,7 @@ function NavigateContent() {
       const pathGroup = new THREE.Group()
       scene.add(pathGroup)
 
-      // Pre-allocate object pool for Google Maps style blue floor walking pathway
+      // Pre-allocate object pool for glowing floor walking pathway
       const basePlaneGeo = new THREE.PlaneGeometry(0.55, 1)
       basePlaneGeo.rotateX(-Math.PI / 2)
       const pathMat = new THREE.MeshPhysicalMaterial({
@@ -192,7 +263,7 @@ function NavigateContent() {
         pathNodePool.push(circleMesh)
       }
 
-      // Create a single sleek glowing chevron, scaled down to fit the screen
+      // Create glowing chevron arrow
       const shape = new THREE.Shape()
       shape.moveTo(0, 0.15)
       shape.lineTo(0.15, -0.15)
@@ -202,8 +273,6 @@ function NavigateContent() {
 
       const extrudeSettings = { depth: 0.02, bevelEnabled: true, bevelSegments: 2, steps: 1, bevelSize: 0.01, bevelThickness: 0.01 }
       const arrowGeo = new THREE.ExtrudeGeometry(shape, extrudeSettings)
-      
-      // Rotate so it lays flat on the floor, pointing sharp tip precisely towards local -Z
       arrowGeo.rotateX(-Math.PI / 2)
       arrowGeo.rotateY(Math.PI)
 
@@ -224,64 +293,129 @@ function NavigateContent() {
 
       let calibrated = false
 
-      renderer.setAnimationLoop((timestamp, xrFrame) => {
+      renderer.setAnimationLoop((_timestamp, xrFrame) => {
         if (!xrFrame) return
-        
+
         const refSpace = renderer.xr.getReferenceSpace()
         if (!refSpace) return
-        
+
         const pose = xrFrame.getViewerPose(refSpace)
-        if (!pose) return
-        
-        if (!calibrated) {
-          let mapAngle = -Math.PI / 2 // Default: facing North (-Y)
-          
-          // If we have a route, we assume the user is starting the session facing the first destination node.
-          // This allows us to mathematically align the XR coordinate system with the 2D floor plan!
-          if (route && route.length > 0 && graph) {
-            const firstNode = graph.nodes[route[0].toNode]
-            if (firstNode) {
-              mapAngle = Math.atan2(firstNode.y - startY, firstNode.x - startX)
+
+        // Improvement #6: IMU fallback when SLAM tracking is temporarily lost
+        if (!pose) {
+          if (calibrated && imuTrackerRef.current.active) {
+            const delta = imuTrackerRef.current.getDeltaM()
+            if (delta.dx !== 0 || delta.dy !== 0) {
+              xrTrackerRef.current.applyExternalDelta(delta.dx, delta.dy)
+              imuTrackerRef.current.resetDelta()
             }
           }
-          
-          xrTrackerRef.current.recalibrate({ x: startX, y: startY, floor: startFloor }, pose, mapAngle)
-          calibrated = true
+          return
+        } else if (calibrated && imuTrackerRef.current.active) {
+          // SLAM tracking recovered or active — reset IMU step accumulator
+          imuTrackerRef.current.resetDelta()
         }
 
-        const worldPos = xrTrackerRef.current.getWorldPosition(pose)
+        // Improvement #3: Deferred calibration (wait for user confirmation tap)
+        if (!calibrated) {
+          if (calibrationRequestRef.current) {
+            let mapAngle = -Math.PI / 2
+            if (routeStateRef.current.route && routeStateRef.current.route.length > 0 && graphRef.current) {
+              const firstNode = graphRef.current.nodes[routeStateRef.current.route[0].toNode]
+              if (firstNode) {
+                mapAngle = Math.atan2(firstNode.y - startY, firstNode.x - startX)
+              }
+            }
+            xrTrackerRef.current.recalibrate(
+              { x: startX, y: startY, floor: startFloor },
+              pose,
+              mapAngle,
+              compassHeading ?? undefined
+            )
+            calibrated = true
+            calibrationRequestRef.current = false
+            setIsTrackerCalibrated(true)
+            // Start IMU standby
+            imuTrackerRef.current.start(compassHeading ?? 0)
+          }
+          renderer.render(scene, camera)
+          return
+        }
+
+        // Improvement #4: Handle mid-route in-session recalibration tap
+        if (recalibrateToNodeRef.current && graphRef.current) {
+          const targetNode = graphRef.current.nodes[recalibrateToNodeRef.current]
+          if (targetNode) {
+            let mapAngle = -Math.PI / 2
+            const currentEdge = routeStateRef.current.route[routeStateRef.current.routeIndex]
+            if (currentEdge) {
+              const nextN = graphRef.current.nodes[currentEdge.toNode]
+              if (nextN && nextN.id !== targetNode.id) {
+                mapAngle = Math.atan2(nextN.y - targetNode.y, nextN.x - targetNode.x)
+              }
+            }
+            xrTrackerRef.current.recalibrate(
+              { x: targetNode.x, y: targetNode.y, floor: targetNode.floor },
+              pose,
+              mapAngle,
+              compassHeading ?? undefined
+            )
+            recalibrateToNodeRef.current = null
+            setProximityAnchorNodeId(null)
+            setNeedsFloorRecalibration(false)
+            speakCue(`Position recalibrated at ${targetNode.label}`)
+          }
+        }
+
+        const rawPos = xrTrackerRef.current.getWorldPosition(pose)
         const deviceHeading = xrTrackerRef.current.getHeading(pose)
 
-        setCurrentX(worldPos.x)
-        setCurrentY(worldPos.y)
+        const { route: currentRoute, routeIndex: currentRouteIndex } = routeStateRef.current
+
+        // Improvement #5: Map-based position snapping
+        let finalX = rawPos.x
+        let finalY = rawPos.y
+        if (currentRoute && currentRoute.length > 0 && graphRef.current) {
+          const pathPoints: { x: number; y: number }[] = [{ x: rawPos.x, y: rawPos.y }]
+          for (let i = currentRouteIndex; i < currentRoute.length; i++) {
+            const edge = currentRoute[i]
+            if (edge.isElevator || edge.isStairs) break
+            const tNode = graphRef.current.nodes[edge.toNode]
+            if (!tNode || tNode.floor !== rawPos.floor) break
+            pathPoints.push({ x: tNode.x, y: tNode.y })
+          }
+          if (pathPoints.length >= 2) {
+            const snapped = snapToPath({ x: rawPos.x, y: rawPos.y }, pathPoints)
+            finalX = snapped.x
+            finalY = snapped.y
+          }
+        }
+
+        setCurrentX(finalX)
+        setCurrentY(finalY)
         setHeading(deviceHeading)
 
-        const { route: currentRoute, routeIndex: currentRouteIndex } = routeStateRef.current
         const currentEdge = currentRoute[currentRouteIndex]
         const nextN = currentEdge ? graphRef.current?.nodes[currentEdge.toNode] : null
 
-        // Extract live camera world matrix to establish dynamic ground elevation plane
         const xrCamera = renderer.xr.getCamera()
         const camPos = new THREE.Vector3()
         const camQuat = new THREE.Quaternion()
         const camScale = new THREE.Vector3()
         xrCamera.matrixWorld.decompose(camPos, camQuat, camScale)
 
-        // In 'local-floor', ARCore vision algorithms set real floor surface precisely at Y = 0.
-        // In 'local' fallback space (where camera starts near Y = 0), physical floor is approx 1.4m below eye level.
         const groundY = camPos.y > 0.7 ? 0 : camPos.y - 1.4
 
-        // Update glowing blue walking path directly on physical floor
         for (let i = 0; i < pathSegmentPool.length; i++) pathSegmentPool[i].visible = false
         for (let i = 0; i < pathNodePool.length; i++) pathNodePool[i].visible = false
 
         if (currentRoute && currentRoute.length > 0 && graphRef.current) {
-          const mapPoints: { x: number; y: number }[] = [{ x: worldPos.x, y: worldPos.y }]
+          const mapPoints: { x: number; y: number }[] = [{ x: finalX, y: finalY }]
           for (let i = currentRouteIndex; i < currentRoute.length; i++) {
             const edge = currentRoute[i]
             if (edge.isElevator || edge.isStairs) break
             const targetNode = graphRef.current.nodes[edge.toNode]
-            if (!targetNode || targetNode.floor !== worldPos.floor) break
+            if (!targetNode || targetNode.floor !== rawPos.floor) break
             mapPoints.push({ x: targetNode.x, y: targetNode.y })
           }
 
@@ -307,41 +441,30 @@ function NavigateContent() {
 
         if (nextN && !currentEdge?.isElevator && !currentEdge?.isStairs) {
           arrowsGroup.visible = true
-          
-          // Current camera forward direction
           const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat)
           forward.y = 0
           if (forward.lengthSq() > 0.001) forward.normalize()
           else forward.set(0, 0, -1)
 
-          // Compute true XR coordinates of target node on the ground plane so arrow and path align perfectly
           const targetXR = xrTrackerRef.current.getXRPosition({ x: nextN.x, y: nextN.y }, pose, groundY)
           const targetVec = new THREE.Vector3(targetXR.x - camPos.x, 0, targetXR.z - camPos.z)
           if (targetVec.lengthSq() > 0.001) targetVec.normalize()
           else targetVec.set(0, 0, -1)
-          
-          // Angle difference between where we are looking and the target
+
           const angleRad = forward.angleTo(targetVec)
-          
           const isCorrectDir = angleRad < (45 * Math.PI / 180)
-          
-          // Green when facing generally towards destination, Red if off-track
           const colorHex = isCorrectDir ? 0x22c55e : 0xef4444
-          
-          // Position the chevron arrow 1.2m in front of the camera, slightly lower at eye/chest level
+
           arrowMesh.position.copy(camPos).add(forward.clone().multiplyScalar(1.2))
           arrowMesh.position.y -= 0.5
-          
+
           arrowMat.color.setHex(colorHex)
           arrowMat.emissive.setHex(colorHex)
-          
-          // Point arrow tip straight along targetVec (synchronized with the blue floor path)
           arrowMesh.lookAt(arrowMesh.position.x + targetVec.x, arrowMesh.position.y, arrowMesh.position.z + targetVec.z)
-
         } else {
           arrowsGroup.visible = false
         }
-        
+
         renderer.render(scene, camera)
       })
     } catch (err) {
@@ -350,12 +473,10 @@ function NavigateContent() {
     }
   }
 
-  // --- Derived render state ---
   const currentEdge = route[routeIndex]
   const nextNode = currentEdge ? graph?.nodes[currentEdge.toNode] : null
   const destNode = graph?.nodes[destNodeId]
-  
-  // Calculate remaining distance roughly by summing current edge + remaining edges
+
   const remainingDistM = useMemo(() => {
     if (!nextNode) return 0
     let dist = distanceM(currentX, currentY, nextNode.x, nextNode.y)
@@ -365,22 +486,78 @@ function NavigateContent() {
     return dist
   }, [currentX, currentY, nextNode, route, routeIndex])
 
-  const arrowRotation = 0
+  const availableFloors = useMemo(() => {
+    if (!graph) return [currentFloor]
+    const floorSet = new Set<number>()
+    if (graph.floors) {
+      Object.keys(graph.floors).forEach(f => floorSet.add(Number(f)))
+    }
+    Object.values(graph.nodes).forEach(n => floorSet.add(n.floor))
+    const sorted = Array.from(floorSet).sort((a, b) => a - b)
+    return sorted.length > 0 ? sorted : [currentFloor]
+  }, [graph, currentFloor])
 
+  function handleManualFloorChange(newFloor: number) {
+    if (newFloor === currentFloor || !graph) return
+    setCurrentFloor(newFloor)
+    setNeedsFloorRecalibration(true)
+
+    if (route.length > 0) {
+      // Find the first node on the new floor along the route
+      let targetIndex = -1
+      let targetNode: GraphNode | null = null
+      for (let i = 0; i < route.length; i++) {
+        const edge = route[i]
+        const n = graph.nodes[edge.toNode]
+        if (n && n.floor === newFloor && !edge.isElevator && !edge.isStairs) {
+          targetIndex = i
+          targetNode = n
+          break
+        }
+      }
+      if (targetIndex === -1) {
+        for (let i = 0; i < route.length; i++) {
+          const n = graph.nodes[route[i].toNode]
+          if (n && n.floor === newFloor) {
+            targetIndex = i
+            targetNode = n
+            break
+          }
+        }
+      }
+
+      if (targetNode && targetIndex !== -1) {
+        setCurrentX(targetNode.x)
+        setCurrentY(targetNode.y)
+        setRouteIndex(targetIndex)
+        if (graph.anchors?.[targetNode.id]) {
+          setProximityAnchorNodeId(targetNode.id)
+        }
+        const nextEdge = route[targetIndex + 1]
+        if (nextEdge?.landmark) {
+          speakCue(`Floor ${newFloor}. Continue, then ${nextEdge.landmark}`)
+        } else {
+          speakCue(`Switched to Floor ${newFloor}`)
+        }
+        return
+      }
+    }
+    speakCue(`Switched to Floor ${newFloor}`)
+  }
+
+  // Improvement #9: Floor transition triggers re-anchor request
   function confirmFloorTransition() {
     if (!nextNode) return
     setCurrentFloor(nextNode.floor)
     setCurrentX(nextNode.x)
     setCurrentY(nextNode.y)
     setRouteIndex(i => i + 1)
-    
-    // Recalibrate tracker to new floor position so SLAM starts fresh here
-    const currentWorldOrigin = { x: nextNode.x, y: nextNode.y, floor: nextNode.floor }
-    // We cannot access xrFrame here directly outside of RAF, but tracking library 
-    // will just keep deltas from whenever it recalibrated.
-    // In a real robust system, we would ask user to scan a QR code out of the elevator.
-    // For demo, we just update state and hope SLAM doesn't drift too much between floors.
-    
+    setNeedsFloorRecalibration(true)
+
+    if (graph?.anchors?.[nextNode.id]) {
+      setProximityAnchorNodeId(nextNode.id)
+    }
+
     const nextEdge = route[routeIndex + 1]
     if (nextEdge?.landmark) {
       speakCue(`Continue, then ${nextEdge.landmark}`)
@@ -388,7 +565,7 @@ function NavigateContent() {
   }
 
   if (xrSupported === null) {
-    return <div className="min-h-screen bg-background flex items-center justify-center">Checking device compatibility...</div>
+    return <div className="min-h-screen bg-background flex items-center justify-center text-muted-foreground">Checking device compatibility...</div>
   }
 
   if (routeError) {
@@ -413,12 +590,18 @@ function NavigateContent() {
 
   return (
     <div className="min-h-screen bg-background relative flex flex-col items-center justify-center overflow-hidden">
-      
       {!arSessionActive ? (
         <div className="p-8 text-center max-w-sm w-full animate-in fade-in slide-in-from-bottom-4 duration-500">
           <h1 className="text-2xl font-bold mb-2">Ready to Navigate</h1>
-          <p className="text-muted-foreground mb-8">Follow the on-screen arrows to your destination.</p>
-          
+          <p className="text-muted-foreground mb-6">Follow the on-screen arrows to your destination.</p>
+
+          {compassHeading !== null && (
+            <div className="mb-6 inline-flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-emerald-400 text-xs font-semibold">
+              <Compass className="w-4 h-4 animate-spin-slow" />
+              <span>Compass Active ({Math.round(compassHeading)}°)</span>
+            </div>
+          )}
+
           <button
             onClick={startAR}
             className="w-full bg-primary text-primary-foreground py-4 rounded-2xl font-semibold text-lg shadow-lg hover:shadow-primary/20 transition-all active:scale-95"
@@ -429,10 +612,64 @@ function NavigateContent() {
       ) : null}
 
       {/* DOM Overlay container for WebXR */}
-      <div 
-        ref={overlayRef} 
-        className="fixed inset-0 pointer-events-none"
-      >
+      <div ref={overlayRef} className="fixed inset-0 pointer-events-none">
+        {/* Improvement #3: Deferred Calibration UI Overlay */}
+        {arSessionActive && !isTrackerCalibrated && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 backdrop-blur-md p-6 pointer-events-auto z-50 animate-in fade-in duration-300">
+            <div className="bg-slate-950/90 border border-emerald-500/40 rounded-3xl p-6 max-w-sm w-full text-center shadow-2xl">
+              <div className="w-16 h-16 bg-emerald-500/20 text-emerald-400 rounded-full flex items-center justify-center mx-auto mb-4 border border-emerald-500/40">
+                <Navigation2 className="w-8 h-8 rotate-45 animate-bounce" />
+              </div>
+              <h2 className="text-xl font-bold text-white mb-2">Point & Confirm</h2>
+              <p className="text-sm text-slate-300 mb-6 leading-relaxed">
+                Stand near the starting QR anchor, face down the corridor toward your pathway, and tap below to initialize precise AR tracking.
+              </p>
+              {compassHeading !== null && (
+                <p className="text-xs text-emerald-400 font-mono mb-4">
+                  Compass aligned at {Math.round(compassHeading)}° North
+                </p>
+              )}
+              <button
+                onClick={() => { calibrationRequestRef.current = true }}
+                className="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold py-4 rounded-xl shadow-[0_0_20px_rgba(16,185,129,0.4)] active:scale-95 transition-all"
+              >
+                Confirm Direction & Start
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Improvement #4 & #9: Proximity Re-Anchoring / Floor Calibration Banner */}
+        {arSessionActive && isTrackerCalibrated && (proximityAnchorNodeId || needsFloorRecalibration) && !arrived && (
+          <div className="absolute top-24 left-4 right-4 z-40 max-w-sm mx-auto pointer-events-auto animate-in slide-in-from-top duration-300">
+            <div className="bg-gradient-to-r from-emerald-950/95 to-slate-950/95 border-2 border-emerald-500/60 backdrop-blur-xl rounded-2xl p-4 shadow-[0_0_25px_rgba(16,185,129,0.25)] flex items-center gap-4">
+              <div className="p-3 bg-emerald-500/20 text-emerald-400 rounded-xl border border-emerald-500/40 shrink-0">
+                <RefreshCw className="w-6 h-6 animate-spin" style={{ animationDuration: '4s' }} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-bold text-emerald-400 uppercase tracking-wider flex items-center gap-1">
+                  <Sparkles className="w-3.5 h-3.5" /> Zero-Drift Anchor
+                </p>
+                <p className="text-sm font-semibold text-white truncate mt-0.5">
+                  Near {proximityAnchorNodeId ? graph?.nodes[proximityAnchorNodeId]?.label : 'Elevator Exit'}?
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  if (proximityAnchorNodeId) {
+                    recalibrateToNodeRef.current = proximityAnchorNodeId
+                  } else if (nextNode) {
+                    recalibrateToNodeRef.current = nextNode.id
+                  }
+                }}
+                className="px-3.5 py-2 bg-emerald-500 text-slate-950 text-xs font-extrabold rounded-xl shadow hover:bg-emerald-400 active:scale-95 transition-transform shrink-0"
+              >
+                Tap to Sync
+              </button>
+            </div>
+          </div>
+        )}
+
         {arSessionActive && graph && route.length > 0 && (
           <>
             <NavDashboard
@@ -447,6 +684,7 @@ function NavigateContent() {
               profile={profile}
               arrived={arrived}
             />
+            {/* Improvement #8: Pass live heading to NavMiniMap */}
             <NavMiniMap
               graph={graph}
               route={route}
@@ -455,7 +693,57 @@ function NavigateContent() {
               currentY={currentY}
               currentFloor={currentFloor}
               arrived={arrived}
+              heading={heading}
             />
+
+            {/* Floor Counter: displayed only when current location and destination are on different floors */}
+            {destNode && currentFloor !== destNode.floor && !arrived && (
+              <div className="absolute left-4 top-1/2 -translate-y-1/2 z-40 pointer-events-auto animate-in fade-in slide-in-from-left duration-300">
+                <div className="bg-slate-950/90 border border-emerald-500/40 backdrop-blur-2xl rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.7)] p-2 flex flex-col items-center gap-1.5 min-w-[58px]">
+                  <div className="flex flex-col items-center gap-0.5 pb-1 border-b border-slate-800/80 w-full text-center">
+                    <Layers className="w-4 h-4 text-emerald-400 animate-pulse" />
+                    <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400 font-mono">Floor</span>
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      const nextFloor = availableFloors.find(f => f > currentFloor)
+                      if (nextFloor !== undefined) handleManualFloorChange(nextFloor)
+                    }}
+                    disabled={!availableFloors.some(f => f > currentFloor)}
+                    className="w-10 h-10 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:hover:bg-slate-900 disabled:cursor-not-allowed border border-slate-700/60 flex items-center justify-center text-slate-200 active:scale-90 transition-all shadow-inner group"
+                    title="Next Floor Up"
+                    type="button"
+                  >
+                    <ChevronUp className="w-6 h-6 text-emerald-400 group-hover:scale-110 transition-transform stroke-[2.5]" />
+                  </button>
+
+                  <div className="py-1.5 flex flex-col items-center justify-center">
+                    <span className="text-2xl font-black font-mono tracking-tight text-white drop-shadow-[0_2px_10px_rgba(16,185,129,0.3)]">
+                      {currentFloor}
+                    </span>
+                    <span className="text-[9px] font-semibold text-amber-400 px-1.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 whitespace-nowrap mt-0.5">
+                      Dest: {destNode.floor}
+                    </span>
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      const prevFloors = availableFloors.filter(f => f < currentFloor)
+                      if (prevFloors.length > 0) {
+                        handleManualFloorChange(prevFloors[prevFloors.length - 1])
+                      }
+                    }}
+                    disabled={!availableFloors.some(f => f < currentFloor)}
+                    className="w-10 h-10 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:hover:bg-slate-900 disabled:cursor-not-allowed border border-slate-700/60 flex items-center justify-center text-slate-200 active:scale-90 transition-all shadow-inner group"
+                    title="Next Floor Down"
+                    type="button"
+                  >
+                    <ChevronDown className="w-6 h-6 text-emerald-400 group-hover:scale-110 transition-transform stroke-[2.5]" />
+                  </button>
+                </div>
+              </div>
+            )}
           </>
         )}
 
@@ -473,7 +761,7 @@ function NavigateContent() {
 
             {/* Elevator / Stairs transition */}
             {(currentEdge?.isElevator || currentEdge?.isStairs) && !arrived && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-sm pointer-events-auto">
+              <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-sm pointer-events-auto z-40">
                 <div className="bg-background rounded-3xl p-8 mx-6 text-center border border-border max-w-sm w-full animate-in zoom-in-95 duration-300">
                   <div className="w-20 h-20 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-4">
                     <p className="text-4xl">{currentEdge.isElevator ? '🛗' : '🪜'}</p>
@@ -492,7 +780,7 @@ function NavigateContent() {
 
             {/* Arrival Screen */}
             {arrived && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-sm pointer-events-auto">
+              <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-sm pointer-events-auto z-50">
                 <div className="bg-background rounded-3xl p-8 mx-6 text-center border border-border max-w-sm w-full animate-in zoom-in-95 duration-300">
                   <div className="w-20 h-20 bg-green-500/10 rounded-full flex items-center justify-center mx-auto mb-4 text-green-500">
                     <svg viewBox="0 0 24 24" className="w-10 h-10 fill-current"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>

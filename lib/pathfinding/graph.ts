@@ -13,10 +13,11 @@ export async function loadGraph(hospitalId: string): Promise<Graph> {
 
   const supabase = createAdminClient()
 
-  const [{ data: rawNodes }, { data: rawEdges }, { data: rawFloors }] = await Promise.all([
+  const [{ data: rawNodes }, { data: rawEdges }, { data: rawFloors }, { data: rawAnchors }] = await Promise.all([
     supabase.from('nodes').select('*').eq('hospital_id', hospitalId),
     supabase.from('edges').select('*').eq('hospital_id', hospitalId),
     supabase.from('floors').select('*').eq('hospital_id', hospitalId),
+    supabase.from('qr_anchors').select('id, node_id').eq('hospital_id', hospitalId),
   ])
 
   const floors: Record<number, { floorPlanUrl: string | null; scaleMpp: number }> = {}
@@ -61,7 +62,13 @@ export async function loadGraph(hospitalId: string): Promise<Graph> {
     edges.push({ ...base, id: `${e.id}_rev`, fromNode: e.to_node, toNode: e.from_node, landmark: null })
   }
 
-  const graph: Graph = { nodes, edges, floors }
+  // Build nodeId → anchorId map for proximity re-anchoring in the navigation UI
+  const anchors: Record<string, string> = {}
+  for (const a of rawAnchors ?? []) {
+    anchors[a.node_id] = a.id
+  }
+
+  const graph: Graph = { nodes, edges, floors, anchors }
   cache[hospitalId] = { graph, loadedAt: Date.now() }
   return graph
 }

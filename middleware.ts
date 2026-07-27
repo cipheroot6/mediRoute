@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createServerClient } from '@supabase/ssr'
 
-export async function proxy(request: NextRequest) {
-  // Only protect /admin routes
-  if (!request.nextUrl.pathname.startsWith('/admin')) {
+export async function middleware(request: NextRequest) {
+  const isAdminPage = request.nextUrl.pathname.startsWith('/admin')
+  const isAdminApi = request.nextUrl.pathname.startsWith('/api/admin')
+
+  if (!isAdminPage && !isAdminApi) {
     return NextResponse.next()
   }
 
@@ -27,6 +29,9 @@ export async function proxy(request: NextRequest) {
   const { data: { user } } = await supabase.auth.getUser()
 
   if (!user) {
+    if (isAdminApi) {
+      return NextResponse.json({ error: 'Unauthorized: Admin authentication required' }, { status: 401 })
+    }
     return NextResponse.redirect(new URL('/login', request.url))
   }
 
@@ -34,5 +39,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/admin/:path*'],
+  matcher: ['/admin/:path*', '/api/admin/:path*'],
 }
