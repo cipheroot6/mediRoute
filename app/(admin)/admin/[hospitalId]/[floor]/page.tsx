@@ -273,14 +273,21 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
       const text = await file.text()
       const data = JSON.parse(text)
       
+      const nodesToUpload = Array.isArray(data.nodes) ? data.nodes : (Array.isArray(data) ? data : [])
+      const edgesToUpload = Array.isArray(data.edges) ? data.edges : []
+
+      if (nodesToUpload.length === 0 && edgesToUpload.length === 0) {
+        throw new Error('No nodes or edges found in JSON. Ensure your JSON has {"nodes": [...], "edges": [...]}')
+      }
+      
       const res = await fetch('/api/admin/bulk-upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           hospitalId,
           floor: floorNumber,
-          nodes: data.nodes || [],
-          edges: data.edges || []
+          nodes: nodesToUpload,
+          edges: edgesToUpload
         })
       })
       
