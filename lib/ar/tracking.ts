@@ -125,31 +125,27 @@ export function createXRTracker(): XRTracker {
       externalDx = 0
       externalDy = 0
 
+      // Calculate camera's actual forward direction in XR space at calibration time
+      const q = currentPose.transform.orientation
+      const fx = -2 * (q.x * q.z + q.w * q.y)
+      const fz = -1 + 2 * (q.x * q.x + q.y * q.y)
+      const xrAngle = Math.atan2(fz, fx)
+
+      trackingTheta = mapAngleRad - xrAngle
+
       if (typeof compassHeadingDeg === 'number' && isFinite(compassHeadingDeg)) {
         compassAvailable = true
         latestCompassDeg = compassHeadingDeg
 
-        // Magnetic heading is CW from North. Convert to CCW math radians:
-        //   0°N → 90° in standard, 90°E → 0°, 180°S → -90° etc.
-        //   compassRad (CCW from East) = (90 - compassDeg) * π/180
-        const compassRad = (90 - compassHeadingDeg) * (Math.PI / 180)
+        // Magnetic heading is CW from North (0). 
+        // We want a CW angle from East (+X) to match the map's left-handed coordinate system (+Y down).
+        const compassCwRad = (compassHeadingDeg - 90) * (Math.PI / 180)
 
-        // The user is facing compassRad in map space AT calibration time.
-        // We assume they are facing toward mapAngleRad (direction to first waypoint).
-        // So: mapAngleRad corresponds to compassRad in physical space.
-        // mapNorthOffset = offset so that compass → map heading is always:
-        //   mapAngle = compassRad_any + mapNorthOffset
-        mapNorthOffsetRad = mapAngleRad - compassRad
-
-        // trackingTheta: when device moves forward (XR -Z, dz_xr = −d), it should
-        // advance in direction mapAngleRad in map space.
-        // From movement equations:  result_angle = θ − π/2
-        // So θ = mapAngleRad + π/2
-        trackingTheta = mapAngleRad + Math.PI / 2
+        // The user is facing compassCwRad in the physical world AT calibration time.
+        // This corresponds to mapAngleRad in the map space.
+        mapNorthOffsetRad = mapAngleRad - compassCwRad
       } else {
         compassAvailable = false
-        // Existing fallback: XR -Z maps to mapAngleRad
-        trackingTheta = mapAngleRad + Math.PI / 2
       }
 
       // Reset Kalman with a very tight covariance (we know exactly where we are)
@@ -195,19 +191,18 @@ export function createXRTracker(): XRTracker {
 
     getHeading(currentPose) {
       if (compassAvailable) {
-        // Convert live compass bearing (CW from N) to CCW-from-East radians, then to map angle
-        const compassRad = (90 - latestCompassDeg) * (Math.PI / 180)
-        const mapAngleRad = compassRad + mapNorthOffsetRad
+        // Convert live compass bearing (CW from N) to CW from East
+        const compassCwRad = (latestCompassDeg - 90) * (Math.PI / 180)
+        const mapAngleRad = compassCwRad + mapNorthOffsetRad
         return mapAngleRad * (180 / Math.PI)
       }
 
-      // Fallback: derive heading from SLAM quaternion yaw
+      // Fallback: derive heading from SLAM quaternion
       const q = currentPose.transform.orientation
-      const yaw = Math.atan2(
-        2 * (q.w * q.y + q.x * q.z),
-        1 - 2 * (q.y * q.y + q.z * q.z)
-      )
-      return yaw * (180 / Math.PI)
+      const fx = -2 * (q.x * q.z + q.w * q.y)
+      const fz = -1 + 2 * (q.x * q.x + q.y * q.y)
+      const xrAngle = Math.atan2(fz, fx)
+      return (xrAngle + trackingTheta) * (180 / Math.PI)
     },
 
     getXRPosition(mapPos, currentPose, targetY = 0) {
