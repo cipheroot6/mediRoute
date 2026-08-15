@@ -200,8 +200,9 @@ function NavigateContent() {
     if (!navigator.xr || !overlayRef.current) return
 
     try {
-      const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true })
-      renderer.setPixelRatio(window.devicePixelRatio)
+      // Performance Optimization: disable antialias and cap pixel ratio for smooth WebXR frame rates
+      const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: false })
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
       renderer.setSize(window.innerWidth, window.innerHeight)
       renderer.xr.enabled = true
       renderer.xr.setReferenceSpaceType('local-floor')
