@@ -34,6 +34,12 @@ export type XRTracker = {
   getXRPosition: (mapPos: { x: number; y: number }, currentPose: XRViewerPose, targetY?: number) => { x: number; y: number; z: number }
   /** Apply an external position correction (e.g. from IMU dead reckoning when SLAM is lost). */
   applyExternalDelta: (dxMetres: number, dyMetres: number) => void
+  /**
+   * Resets the X/Y world origin without altering the established rotational tracking.
+   * Use this for mid-session proximity syncs where we know where the user is,
+   * but don't want to assume what direction they are currently looking.
+   */
+  reanchorPosition: (worldPos: XRPosition, currentPose: XRViewerPose) => void
 }
 
 // ─── Kalman Filter (1-D, applied independently to X and Y) ───────────────────
@@ -149,6 +155,18 @@ export function createXRTracker(): XRTracker {
       }
 
       // Reset Kalman with a very tight covariance (we know exactly where we are)
+      kalmanX = { estimate: worldPos.x, errorCovariance: 0.005 }
+      kalmanY = { estimate: worldPos.y, errorCovariance: 0.005 }
+      kalmanInitialised = true
+    },
+
+    reanchorPosition(worldPos, currentPose) {
+      worldOrigin = worldPos
+      poseOrigin = getPoseTranslation(currentPose)
+      externalDx = 0
+      externalDy = 0
+
+      // Reset Kalman, but DO NOT touch trackingTheta or compass offsets.
       kalmanX = { estimate: worldPos.x, errorCovariance: 0.005 }
       kalmanY = { estimate: worldPos.y, errorCovariance: 0.005 }
       kalmanInitialised = true

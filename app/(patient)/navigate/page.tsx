@@ -353,7 +353,7 @@ function NavigateContent() {
             calibrationRequestRef.current = false
             setIsTrackerCalibrated(true)
             // Start IMU standby
-            imuTrackerRef.current.start(compassHeading ?? 0)
+            imuTrackerRef.current.start(xrTrackerRef.current.getHeading(pose))
           }
           renderer.render(scene, camera)
           return
@@ -363,19 +363,9 @@ function NavigateContent() {
         if (recalibrateToNodeRef.current && graphRef.current) {
           const targetNode = graphRef.current.nodes[recalibrateToNodeRef.current]
           if (targetNode) {
-            let mapAngle = -Math.PI / 2
-            const currentEdge = routeStateRef.current.route[routeStateRef.current.routeIndex]
-            if (currentEdge) {
-              const nextN = graphRef.current.nodes[currentEdge.toNode]
-              if (nextN && nextN.id !== targetNode.id) {
-                mapAngle = Math.atan2(nextN.y - targetNode.y, nextN.x - targetNode.x)
-              }
-            }
-            xrTrackerRef.current.recalibrate(
+            xrTrackerRef.current.reanchorPosition(
               { x: targetNode.x, y: targetNode.y, floor: targetNode.floor },
-              pose,
-              mapAngle,
-              compassHeading ?? undefined
+              pose
             )
             recalibrateToNodeRef.current = null
             setProximityAnchorNodeId(null)
@@ -386,6 +376,11 @@ function NavigateContent() {
 
         const rawPos = xrTrackerRef.current.getWorldPosition(pose)
         const deviceHeading = xrTrackerRef.current.getHeading(pose)
+        
+        // Pass the synchronized map heading to the IMU tracker
+        if (imuTrackerRef.current.active) {
+          imuTrackerRef.current.setHeading(deviceHeading)
+        }
 
         const { route: currentRoute, routeIndex: currentRouteIndex } = routeStateRef.current
 
@@ -393,18 +388,23 @@ function NavigateContent() {
         let finalX = rawPos.x
         let finalY = rawPos.y
         if (currentRoute && currentRoute.length > 0 && graphRef.current) {
-          const pathPoints: { x: number; y: number }[] = [{ x: rawPos.x, y: rawPos.y }]
-          for (let i = currentRouteIndex; i < currentRoute.length; i++) {
-            const edge = currentRoute[i]
-            if (edge.isElevator || edge.isStairs) break
-            const tNode = graphRef.current.nodes[edge.toNode]
-            if (!tNode || tNode.floor !== rawPos.floor) break
-            pathPoints.push({ x: tNode.x, y: tNode.y })
-          }
-          if (pathPoints.length >= 2) {
-            const snapped = snapToPath({ x: rawPos.x, y: rawPos.y }, pathPoints)
-            finalX = snapped.x
-            finalY = snapped.y
+          const currentEdge = currentRoute[currentRouteIndex]
+          const startNode = currentEdge ? graphRef.current.nodes[currentEdge.fromNode] : null
+          
+          if (startNode) {
+            const pathPoints: { x: number; y: number }[] = [{ x: startNode.x, y: startNode.y }]
+            for (let i = currentRouteIndex; i < currentRoute.length; i++) {
+              const edge = currentRoute[i]
+              if (edge.isElevator || edge.isStairs) break
+              const tNode = graphRef.current.nodes[edge.toNode]
+              if (!tNode || tNode.floor !== rawPos.floor) break
+              pathPoints.push({ x: tNode.x, y: tNode.y })
+            }
+            if (pathPoints.length >= 2) {
+              const snapped = snapToPath({ x: rawPos.x, y: rawPos.y }, pathPoints)
+              finalX = snapped.x
+              finalY = snapped.y
+            }
           }
         }
 
@@ -495,13 +495,31 @@ function NavigateContent() {
   const destNode = graph?.nodes[destNodeId]
 
   const remainingDistM = useMemo(() => {
-    if (!nextNode) return 0
-    let dist = distanceM(currentX, currentY, nextNode.x, nextNode.y)
+    if (!nextNode || !graph || !currentEdge) return 0
+    const startNode = graph.nodes[currentEdge.fromNode]
+    
+    let currentEdgeRemainingM = 0
+    if (startNode) {
+      // Calculate geometric distance from start to next node in map units
+      const geoTotal = distanceM(startNode.x, startNode.y, nextNode.x, nextNode.y)
+      // Calculate geometric distance from current XR location to next node
+      const geoRemaining = distanceM(currentX, currentY, nextNode.x, nextNode.y)
+      
+      // Calculate the proportion (0.0 to 1.0) of the edge we have left to travel
+      const proportion = geoTotal > 0.001 ? Math.max(0, Math.min(1, geoRemaining / geoTotal)) : 0
+      
+      // Scale the custom database distance by our proportion
+      currentEdgeRemainingM = proportion * currentEdge.distanceM
+    } else {
+      currentEdgeRemainingM = distanceM(currentX, currentY, nextNode.x, nextNode.y)
+    }
+
+    let dist = currentEdgeRemainingM
     for (let i = routeIndex + 1; i < route.length; i++) {
       dist += route[i].distanceM
     }
     return dist
-  }, [currentX, currentY, nextNode, route, routeIndex])
+  }, [currentX, currentY, nextNode, graph, currentEdge, route, routeIndex])
 
   const availableFloors = useMemo(() => {
     if (!graph) return [currentFloor]
