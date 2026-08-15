@@ -712,8 +712,8 @@ function NavigateContent() {
               heading={heading}
             />
 
-            {/* Floor Counter: displayed only when current location and destination are on different floors */}
-            {destNode && currentFloor !== destNode.floor && !arrived && (
+            {/* Floor Counter: always available so user can manually update if they take stairs */}
+            {destNode && !arrived && (
               <div className="absolute left-4 top-1/2 -translate-y-1/2 z-40 pointer-events-auto animate-in fade-in slide-in-from-left duration-300">
                 <div className="bg-slate-950/90 border border-emerald-500/40 backdrop-blur-2xl rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.7)] p-2 flex flex-col items-center gap-1.5 min-w-[58px]">
                   <div className="flex flex-col items-center gap-0.5 pb-1 border-b border-slate-800/80 w-full text-center">
