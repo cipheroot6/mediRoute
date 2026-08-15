@@ -1,9 +1,7 @@
 'use client'
 import { useState, useRef, useEffect, use } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { Plus, Maximize, Move, Upload, X, ZoomIn, ZoomOut, Sparkles, Trash2, Loader2 } from 'lucide-react'
-import AIReviewPanel from '@/components/admin/AIReviewPanel'
-import type { AISuggestedNode, AISuggestedEdge } from '@/app/api/admin/analyze-floor/route'
+import { Plus, Maximize, Move, Upload, X, ZoomIn, ZoomOut, Trash2, Loader2 } from 'lucide-react'
 import { NODE_HIT_THRESHOLD_PX } from '@/lib/constants'
 
 const SCALE_PRESETS = [
@@ -13,7 +11,7 @@ const SCALE_PRESETS = [
   { label: '10m ref', value: 10 },
 ]
 
-type Mode = 'calibrating' | 'placing-nodes' | 'placing-edges' | 'reviewing-ai'
+type Mode = 'calibrating' | 'placing-nodes' | 'placing-edges'
 type CalibrationStep = 'point-a' | 'point-b' | 'enter-distance' | 'done'
 
 type NodeData = {
@@ -82,15 +80,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const [editType, setEditType] = useState<NodeData['type']>('junction')
   const [editAccessible, setEditAccessible] = useState(true)
 
-  // AI state
-  const [aiLoading, setAiLoading] = useState(false)
-  const [aiError, setAiError] = useState<string | null>(null)
-  const [aiStatusMessage, setAiStatusMessage] = useState<string>('')
-  const [pendingNodes, setPendingNodes] = useState<AISuggestedNode[]>([])
-  const [pendingEdges, setPendingEdges] = useState<AISuggestedEdge[]>([])
-  const [aiSummary] = useState('')
-  const [aiWarnings] = useState<string[]>([])
-  const [aiSaving, setAiSaving] = useState(false)
+
 
   const imgRef = useRef<HTMLImageElement>(null)
   const supabase = createClient()
@@ -270,6 +260,43 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
       setMode('placing-nodes')
       setLoading(false)
     }
+  }
+
+  async function handleJsonUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    
+    setLoading(true)
+    setUploadStatus('Uploading JSON data...')
+    
+    try {
+      const text = await file.text()
+      const data = JSON.parse(text)
+      
+      const res = await fetch('/api/admin/bulk-upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hospitalId,
+          floor: floorNumber,
+          nodes: data.nodes || [],
+          edges: data.edges || []
+        })
+      })
+      
+      if (!res.ok) {
+        const err = await res.json()
+        throw new Error(err.error || 'Upload failed')
+      }
+      
+      window.location.reload()
+    } catch (err: unknown) {
+      alert('JSON Upload failed: ' + (err instanceof Error ? err.message : String(err)))
+      setLoading(false)
+      setUploadStatus('')
+    }
+    
+    e.target.value = ''
   }
 
   function handleCalibrationClick(px: number, py: number) {
@@ -457,228 +484,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
     setEdges(edges.filter(e => e.id !== edgeId))
   }
 
-  async function handleAnalyzeAI() {
-    if (!floorPlanUrl) return
-    setAiLoading(true)
-    setAiError(null)
-    try {
-      // 1. Fetch all floors for this hospital
-      const floorsRes = await fetch('/api/admin/floors')
-      const allFloorsData: { hospital_id: string; floor_number: number; floor_plan_url?: string; scale_mpp?: number }[] = await floorsRes.json()
-      const hospitalFloors = (Array.isArray(allFloorsData) ? allFloorsData : [])
-        .filter(f => f.hospital_id === hospitalId && f.floor_plan_url)
-        .sort((a, b) => a.floor_number - b.floor_number)
 
-      if (hospitalFloors.length === 0) {
-        hospitalFloors.push({ hospital_id: hospitalId, floor_number: floorNumber, floor_plan_url: floorPlanUrl, scale_mpp: scaleMpp || 0.05 })
-      }
-
-      const allGeneratedNodesByFloor: Record<number, { id: string; label: string; type: string }[]> = {}
-
-      // 2. Process each floor sequentially (serial requests to AI)
-      for (let i = 0; i < hospitalFloors.length; i++) {
-        const fl = hospitalFloors[i]
-        const flNum = fl.floor_number
-        const flUrl = fl.floor_plan_url || ''
-        const flScale = fl.scale_mpp || scaleMpp || 0.05
-
-        setAiStatusMessage(`AI is analyzing Floor ${flNum} (${i + 1} of ${hospitalFloors.length}). Reading room labels, tracing corridors, and building graph...`)
-
-        let imgWidth = imgRef.current?.naturalWidth || imgW || 1000
-        let imgHeight = imgRef.current?.naturalHeight || imgH || 1000
-
-        if (flNum !== floorNumber) {
-          const dims = await new Promise<{ w: number; h: number }>((resolve) => {
-            const tempImg = new Image()
-            tempImg.onload = () => resolve({ w: tempImg.naturalWidth, h: tempImg.naturalHeight })
-            tempImg.onerror = () => resolve({ w: 1000, h: 1000 })
-            tempImg.src = flUrl
-          })
-          if (dims.w > 0 && dims.h > 0) {
-            imgWidth = dims.w
-            imgHeight = dims.h
-          }
-        }
-
-        const res = await fetch('/api/admin/analyze-floor', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ floorPlanUrl: flUrl, scaleMpp: flScale, imageWidth: imgWidth, imageHeight: imgHeight })
-        })
-        const data = await res.json()
-        if (!res.ok) {
-          throw new Error(`Floor ${flNum} Analysis failed: ${data.error ?? 'Unknown error'}`)
-        }
-
-        setAiStatusMessage(`Saving ${data.nodes.length} waypoints and ${data.edges.length} connections for Floor ${flNum}...`)
-
-        // Clear previous nodes for this floor before saving AI structure
-        const existingNodesRes = await supabase.from('nodes').select('id').eq('hospital_id', hospitalId).eq('floor', flNum)
-        if (existingNodesRes.data && existingNodesRes.data.length > 0) {
-          for (const n of existingNodesRes.data) {
-            await fetch('/api/admin/nodes', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: n.id }) })
-          }
-        }
-
-        // Save new nodes
-        const tempIdToDbId: Record<string, string> = {}
-        const savedNodes: { id: string; label: string; type: string }[] = []
-        for (const n of data.nodes) {
-          const postNode = await fetch('/api/admin/nodes', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              hospitalId,
-              floor: flNum,
-              label: n.label,
-              type: n.type,
-              x: n.x,
-              y: n.y,
-              accessible: n.accessible
-            })
-          })
-          if (postNode.ok) {
-            const saved = await postNode.json()
-            tempIdToDbId[n.tempId] = saved.id
-            savedNodes.push(saved)
-          }
-        }
-        allGeneratedNodesByFloor[flNum] = savedNodes
-
-        // Save new edges
-        for (const e of data.edges) {
-          const fromId = tempIdToDbId[e.fromTempId]
-          const toId = tempIdToDbId[e.toTempId]
-          if (!fromId || !toId) continue
-          const fn = data.nodes.find((x: { tempId: string; x: number; y: number }) => x.tempId === e.fromTempId)
-          const tn = data.nodes.find((x: { tempId: string; x: number; y: number }) => x.tempId === e.toTempId)
-          if (!fn || !tn) continue
-          const dist = Math.sqrt((tn.x - fn.x) ** 2 + (tn.y - fn.y) ** 2)
-          await fetch('/api/admin/edges', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              hospitalId,
-              fromNode: fromId,
-              toNode: toId,
-              distanceM: dist,
-              accessible: e.accessible,
-              isStairs: e.isStairs,
-              isElevator: e.isElevator,
-              landmark: null
-            })
-          })
-        }
-      }
-
-      // 3. Connect vertical circulation across adjacent floors (Elevators and Stairs)
-      if (hospitalFloors.length > 1) {
-        setAiStatusMessage('Connecting elevators and stairs across all floors...')
-        for (let i = 0; i < hospitalFloors.length - 1; i++) {
-          const f1Num = hospitalFloors[i].floor_number
-          const f2Num = hospitalFloors[i + 1].floor_number
-          const f1Nodes = allGeneratedNodesByFloor[f1Num] || []
-          const f2Nodes = allGeneratedNodesByFloor[f2Num] || []
-
-          const f1Elevators = f1Nodes.filter(n => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
-          const f2Elevators = f2Nodes.filter(n => n.type === 'elevator' || n.label.toLowerCase().includes('elev') || n.label.toLowerCase().includes('lift'))
-
-          for (const el1 of f1Elevators) {
-            const el2 = f2Elevators[0]
-            if (el2) {
-              await fetch('/api/admin/edges', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  hospitalId,
-                  fromNode: el1.id,
-                  toNode: el2.id,
-                  distanceM: 5,
-                  accessible: true,
-                  isStairs: false,
-                  isElevator: true,
-                  landmark: `Elevator connection Floor ${f1Num} to ${f2Num}`
-                })
-              })
-            }
-          }
-
-          const f1Stairs = f1Nodes.filter(n => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
-          const f2Stairs = f2Nodes.filter(n => n.type === 'stairs' || n.label.toLowerCase().includes('stair'))
-
-          for (const st1 of f1Stairs) {
-            const st2 = f2Stairs[0]
-            if (st2) {
-              await fetch('/api/admin/edges', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  hospitalId,
-                  fromNode: st1.id,
-                  toNode: st2.id,
-                  distanceM: 8,
-                  accessible: false,
-                  isStairs: true,
-                  isElevator: false,
-                  landmark: `Stairs Floor ${f1Num} to ${f2Num}`
-                })
-              })
-            }
-          }
-        }
-      }
-
-      // 4. Reload local state for the currently displayed floor
-      const [{ data: nData }, { data: eData }] = await Promise.all([
-        supabase.from('nodes').select('*').eq('hospital_id', hospitalId).eq('floor', floorNumber),
-        supabase.from('edges').select('*').eq('hospital_id', hospitalId)
-      ])
-      if (nData) {
-        setNodes(nData.map((n: { id: string; label: string; type: NodeData['type']; x: number; y: number; accessible: boolean }) => ({ id: n.id, label: n.label, type: n.type, x: n.x, y: n.y, accessible: n.accessible })))
-      }
-      if (eData) {
-        setEdges(eData.map((e: { id: string; from_node: string; to_node: string; distance_m: number; accessible: boolean; is_stairs?: boolean; is_elevator?: boolean; landmark?: string }) => ({
-          id: e.id,
-          fromNode: e.from_node,
-          toNode: e.to_node,
-          distanceM: e.distance_m,
-          accessible: e.accessible,
-          isStairs: Boolean(e.is_stairs),
-          isElevator: Boolean(e.is_elevator),
-          landmark: e.landmark ?? null
-        })))
-      }
-
-      setAiStatusMessage('')
-      setMode('placing-nodes')
-      alert(`AI Analysis complete! Successfully analyzed and linked all ${hospitalFloors.length} floor(s).`)
-    } catch (err: unknown) {
-      setAiError(err instanceof Error ? err.message : 'AI analysis failed')
-    } finally {
-      setAiLoading(false)
-    }
-  }
-
-  async function confirmAISuggestions() {
-    setAiSaving(true)
-    try {
-      const idMap: Record<string, string> = {}
-      for (const n of pendingNodes) {
-        const res = await fetch('/api/admin/nodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hospitalId, floor: floorNumber, label: n.label, type: n.type, x: n.x, y: n.y, accessible: n.accessible }) })
-        if (res.ok) { const d = await res.json(); idMap[n.tempId] = d.id; setNodes(prev => [...prev, { id: d.id, label: d.label, type: d.type, x: d.x, y: d.y, accessible: d.accessible }]) }
-      }
-      for (const e of pendingEdges) {
-        const fromId = idMap[e.fromTempId], toId = idMap[e.toTempId]
-        if (!fromId || !toId) continue
-        const fn = pendingNodes.find(n => n.tempId === e.fromTempId), tn = pendingNodes.find(n => n.tempId === e.toTempId)
-        if (!fn || !tn) continue
-        const dist = Math.sqrt((tn.x - fn.x) ** 2 + (tn.y - fn.y) ** 2)
-        const res = await fetch('/api/admin/edges', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hospitalId, fromNode: fromId, toNode: toId, distanceM: dist, accessible: e.accessible, isStairs: e.isStairs, isElevator: e.isElevator, landmark: null }) })
-        if (res.ok) { const d = await res.json(); setEdges(prev => [...prev, { id: d.id, fromNode: d.from_node, toNode: d.to_node, distanceM: d.distance_m, accessible: d.accessible, isStairs: d.is_stairs, isElevator: d.is_elevator, landmark: d.landmark }]) }
-      }
-      setPendingNodes([]); setPendingEdges([]); setMode('placing-nodes')
-    } finally { setAiSaving(false) }
-  }
 
   if (loading) {
     return (
@@ -731,14 +537,11 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           >
             <Move size={16} className="mr-2" /> Edges
           </button>
-          <button
-            onClick={handleAnalyzeAI}
-            disabled={aiLoading || mode === 'reviewing-ai'}
-            className="px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {aiLoading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-            {aiLoading ? 'Analyzing Floors…' : 'Analyze All Floors with AI'}
-          </button>
+          <label className="px-4 py-2 rounded-md text-sm font-medium flex items-center transition-colors hover:bg-accent hover:text-accent-foreground cursor-pointer">
+            <Upload size={16} className="mr-2" /> JSON
+            <input type="file" className="hidden" accept=".json,application/json" onChange={handleJsonUpload} />
+          </label>
+
           
           <div className="flex items-center gap-1 border-l border-border/50 pl-2 ml-2">
             <button onClick={() => setZoom(z => Math.max(0.1, z - 0.2))} className="p-2 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground">
@@ -763,7 +566,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
           {mode === 'placing-nodes' && 'Click map to add · click existing node to edit/delete'}
           {mode === 'placing-edges' && !edgeStart && 'Click a node to start edge'}
           {mode === 'placing-edges' && edgeStart && 'Click another node to connect'}
-          {mode === 'reviewing-ai' && 'Review AI suggestions in the panel →'}
+
         </div>
 
         <div className="relative inline-block border border-border/50 shadow-2xl bg-black rounded-lg overflow-hidden">
@@ -804,13 +607,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
               )
             })}
 
-            {/* Pending AI edges */}
-            {mode === 'reviewing-ai' && pendingEdges.map(edge => {
-              const from = pendingNodes.find(n => n.tempId === edge.fromTempId)
-              const to   = pendingNodes.find(n => n.tempId === edge.toTempId)
-              if (!from || !to || !scaleMpp) return null
-              return <line key={edge.tempId} x1={from.x/scaleMpp} y1={from.y/scaleMpp} x2={to.x/scaleMpp} y2={to.y/scaleMpp} stroke="#818cf8" strokeWidth={2} strokeDasharray="6 3" opacity={0.7} />
-            })}
+
             
             {/* Active Edge Drawing */}
             {edgeStart && scaleMpp && (
@@ -850,17 +647,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
               )
             })}
 
-            {/* Pending AI nodes */}
-            {mode === 'reviewing-ai' && pendingNodes.map(node => {
-              if (!scaleMpp) return null
-              const color = node.type==='destination' ? '#10b981' : node.type==='entry' ? '#a855f7' : node.type==='junction' ? '#818cf8' : '#f59e0b'
-              return (
-                <g key={node.tempId}>
-                  <circle cx={node.x/scaleMpp} cy={node.y/scaleMpp} r={8} fill={color} stroke="#fff" strokeWidth={2} opacity={0.85} />
-                  <text x={node.x/scaleMpp} y={(node.y/scaleMpp)-12} textAnchor="middle" fill="#a5b4fc" className="text-[10px]" style={{ textShadow: '0 1px 3px black' }}>{node.label}</text>
-                </g>
-              )
-            })}
+
 
             {/* Calibration Visuals */}
             {calibPtA && <circle cx={calibPtA.px} cy={calibPtA.py} r={6} fill="#f59e0b" stroke="#000" strokeWidth={2} />}
@@ -1040,39 +827,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
         </div>
       )}
 
-      {/* AI loading overlay */}
-      {aiLoading && (
-        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm z-50 flex flex-col items-center justify-center gap-4 p-6 text-center">
-          <Loader2 size={40} className="animate-spin text-indigo-400" />
-          <p className="text-lg font-medium">{aiStatusMessage || 'Analyzing floor plans with AI…'}</p>
-          <p className="text-sm text-muted-foreground max-w-sm">AI is reading room labels, tracing corridors, building the navigation graph, and linking multi-floor elevator paths. Please wait...</p>
-        </div>
-      )}
 
-      {/* AI error toast */}
-      {aiError && (
-        <div className="absolute bottom-20 left-1/2 -translate-x-1/2 bg-red-900/80 border border-red-500/50 px-4 py-3 rounded-lg text-sm text-red-200 z-30 flex items-center gap-3 max-w-md">
-          <span>{aiError}</span>
-          <button onClick={() => setAiError(null)} className="underline shrink-0">dismiss</button>
-        </div>
-      )}
-
-      {/* AI review panel */}
-      {mode === 'reviewing-ai' && (
-        <div className="absolute inset-y-16 right-0 z-30 shadow-2xl">
-          <AIReviewPanel
-            nodes={pendingNodes}
-            edges={pendingEdges}
-            summary={aiSummary}
-            warnings={aiWarnings}
-            saving={aiSaving}
-            onNodesChange={setPendingNodes}
-            onEdgesChange={setPendingEdges}
-            onConfirm={confirmAISuggestions}
-            onDiscard={() => { setPendingNodes([]); setPendingEdges([]); setMode('placing-nodes') }}
-          />
-        </div>
-      )}
     </div>
   )
 }
