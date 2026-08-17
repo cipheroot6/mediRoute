@@ -177,27 +177,26 @@ export function createXRTracker(): XRTracker {
     },
 
     getWorldPosition(currentPose) {
-      if (!poseOrigin) return worldOrigin
+      if (!poseOrigin) return { x: worldOrigin.x, y: worldOrigin.y, floor: worldOrigin.floor }
+      
+      const currentT = getPoseTranslation(currentPose)
+      const dx_xr = currentT.x - poseOrigin.x
+      const dz_xr = currentT.z - poseOrigin.z
 
-      const p = getPoseTranslation(currentPose)
-      const dx_xr = p.x - poseOrigin.x
-      const dz_xr = p.z - poseOrigin.z
-
-      // Rotate XR delta → map delta
       const rawMapDx = dx_xr * Math.cos(trackingTheta) - dz_xr * Math.sin(trackingTheta)
       const rawMapDy = dx_xr * Math.sin(trackingTheta) + dz_xr * Math.cos(trackingTheta)
 
-      const rawX = worldOrigin.x + rawMapDx + externalDx
-      const rawY = worldOrigin.y + rawMapDy + externalDy
+      const measuredX = worldOrigin.x + rawMapDx + externalDx
+      const measuredY = worldOrigin.y + rawMapDy + externalDy
 
       // Kalman-smooth the raw measurement
       if (!kalmanInitialised) {
-        kalmanX = { estimate: rawX, errorCovariance: 1 }
-        kalmanY = { estimate: rawY, errorCovariance: 1 }
+        kalmanX = { estimate: measuredX, errorCovariance: 1 }
+        kalmanY = { estimate: measuredY, errorCovariance: 1 }
         kalmanInitialised = true
       } else {
-        kalmanX = kalmanUpdate(kalmanX, rawX)
-        kalmanY = kalmanUpdate(kalmanY, rawY)
+        kalmanX = kalmanUpdate(kalmanX, measuredX)
+        kalmanY = kalmanUpdate(kalmanY, measuredY)
       }
 
       return {

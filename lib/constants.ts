@@ -20,7 +20,7 @@ export const KALMAN_PROCESS_NOISE = 0.008
 export const KALMAN_MEASUREMENT_NOISE = 0.6
 
 // Path snapping — max perpendicular distance before we stop snapping to corridor
-export const PATH_SNAP_MAX_DIST_M = 2.0
+export const PATH_SNAP_MAX_DIST_M = 5.0
 
 // IMU step detection — human average stride, used for dead-reckoning fallback
 export const IMU_STEP_LENGTH_M = 0.75

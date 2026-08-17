@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef, useEffect } from 'react'
 import { Map, Maximize2, Minimize2, Navigation2 } from 'lucide-react'
 import type { Graph, GraphEdge } from '@/types'
 
@@ -27,6 +27,19 @@ export function NavMiniMap({
 }: NavMiniMapProps) {
   const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null)
   const [expanded, setExpanded] = useState(false)
+  
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [containerSize, setContainerSize] = useState({ width: 0, height: 0 })
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver(entries => {
+      setContainerSize({ width: entries[0].contentRect.width, height: entries[0].contentRect.height })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [expanded]) // Re-evaluate when expanded changes just in case
 
   const floorData = graph.floors?.[currentFloor]
   const floorPlanUrl = floorData?.floorPlanUrl
@@ -35,15 +48,22 @@ export function NavMiniMap({
   const userPx = currentX / scaleMpp
   const userPy = currentY / scaleMpp
 
-  const dotLeftPercent = useMemo(() => {
-    if (!imgSize || imgSize.width <= 0) return 50
-    return Math.max(2, Math.min(98, (userPx / imgSize.width) * 100))
-  }, [userPx, imgSize])
+  const dotPosition = useMemo(() => {
+    if (!imgSize || imgSize.width <= 0 || containerSize.width <= 0) return { left: '50%', top: '50%' }
+    
+    const scale = Math.min(containerSize.width / imgSize.width, containerSize.height / imgSize.height)
+    const renderedWidth = imgSize.width * scale
+    const renderedHeight = imgSize.height * scale
+    
+    // offset caused by object-fit: contain centering the image
+    const offsetX = (containerSize.width - renderedWidth) / 2
+    const offsetY = (containerSize.height - renderedHeight) / 2
 
-  const dotTopPercent = useMemo(() => {
-    if (!imgSize || imgSize.height <= 0) return 50
-    return Math.max(2, Math.min(98, (userPy / imgSize.height) * 100))
-  }, [userPy, imgSize])
+    return {
+      left: `${offsetX + (userPx * scale)}px`,
+      top: `${offsetY + (userPy * scale)}px`
+    }
+  }, [userPx, userPy, imgSize, containerSize])
 
   // Calculate route polyline points for current floor
   const polylinePoints = useMemo(() => {
@@ -90,6 +110,7 @@ export function NavMiniMap({
 
       {/* Map Content Container */}
       <div 
+        ref={containerRef}
         onClick={() => setExpanded(e => !e)}
         className="w-full h-full relative cursor-pointer flex items-center justify-center bg-slate-950 overflow-hidden"
       >
@@ -126,7 +147,7 @@ export function NavMiniMap({
 
         {/* Live User Position Dot */}
         <div
-          style={{ left: `${dotLeftPercent}%`, top: `${dotTopPercent}%` }}
+          style={{ left: dotPosition.left, top: dotPosition.top }}
           className="absolute -translate-x-1/2 -translate-y-1/2 z-10 pointer-events-none flex items-center justify-center transition-all duration-200"
         >
           {/* Pulsing Outer Halo */}

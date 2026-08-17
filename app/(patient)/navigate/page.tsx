@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useMemo, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import * as THREE from 'three'
 import { astar } from '@/lib/pathfinding/astar'
-import { distanceM } from '@/lib/utils'
+import { distanceM, getTurnDirection } from '@/lib/utils'
 import { createXRTracker, snapToPath } from '@/lib/ar/tracking'
 import { createIMUTracker } from '@/lib/ar/imu'
 import { speakCue } from '@/lib/voice/speech'
@@ -55,6 +55,10 @@ function NavigateContent() {
   const calibrationRequestRef = useRef(false)
   const recalibrateToNodeRef = useRef<string | null>(null)
   const activeRendererRef = useRef<THREE.WebGLRenderer | null>(null)
+  const lastHeadingRef = useRef<number>(0)
+  
+  const lastSpokenRouteIndexRef = useRef<number>(-1)
+  const lastSpokenDistRef = useRef<number | null>(null)
 
   useEffect(() => {
     const imu = imuTrackerRef.current
@@ -114,6 +118,12 @@ function NavigateContent() {
           return
         }
 
+        // Always sync the starting position with the absolute truth from the database.
+        // This prevents catastrophic failure if the URL params (startX/startY) were 
+        // generated from a stale cache, bookmarked link, or old database state.
+        setCurrentX(g.nodes[startNodeId].x)
+        setCurrentY(g.nodes[startNodeId].y)
+
         const edges = astar(g, startNodeId, destNodeId, profile)
         if (!edges || edges.length === 0) {
           setRouteError(`No path found between your location and ${g.nodes[destNodeId]?.label ?? 'destination'}. The map may not have a connected route yet.`)
@@ -152,12 +162,52 @@ function NavigateContent() {
 
     const dist = distanceM(currentX, currentY, nextNode.x, nextNode.y)
     
+    // Calculate remaining distance exactly like the dashboard to prevent conflicts
+    // between the raw geometric distance and database-overridden edge distances.
+    let currentEdgeRemainingM = dist
+    const startNode = graph.nodes[currentEdge.fromNode]
+    if (startNode) {
+      const geoTotal = distanceM(startNode.x, startNode.y, nextNode.x, nextNode.y)
+      const proportion = geoTotal > 0.001 ? Math.max(0, Math.min(1, dist / geoTotal)) : 0
+      currentEdgeRemainingM = proportion * currentEdge.distanceM
+    }
+    
     // Improvement #7: Use 1.5m threshold for waypoints, 3.0m for final destination
     const threshold = routeIndex === route.length - 1
       ? NODE_ARRIVAL_THRESHOLD_DEST_M
       : NODE_ARRIVAL_THRESHOLD_WAYPOINT_M
 
-    if (dist < threshold) {
+    // Voice Navigation Enhancements: Announce at start of new edge
+    if (lastSpokenRouteIndexRef.current !== routeIndex) {
+      lastSpokenDistRef.current = null
+      lastSpokenRouteIndexRef.current = routeIndex
+      const nextEdge = route[routeIndex + 1]
+      if (nextEdge) {
+        const turn = getTurnDirection(currentEdge, nextEdge, graph)
+        const noun = nextNode?.type === 'elevator' ? 'the elevator' : nextNode?.type === 'stairs' ? 'the stairs' : nextNode?.label || 'the next waypoint'
+        // Only say "Continue straight for..." if they just started a segment or just turned.
+        // Prevent spam if the routeIndex just updated because they arrived at a node.
+        speakCue(`Continue straight for ${Math.round(currentEdge.distanceM)} meters, then ${turn} towards ${noun}.`)
+      }
+    }
+
+    // Voice Navigation Enhancements: Distance thresholds
+    const voiceThresholds = [15, 10, 5]
+    for (const t of voiceThresholds) {
+      if (currentEdgeRemainingM <= t + 0.5 && (lastSpokenDistRef.current === null || lastSpokenDistRef.current > t)) {
+        lastSpokenDistRef.current = t
+        if (routeIndex === route.length - 1) {
+          speakCue(`In ${t} meters, you will reach your destination.`)
+        } else {
+          const nextEdge = route[routeIndex + 1]
+          const turn = nextEdge ? getTurnDirection(currentEdge, nextEdge, graph) : 'continue'
+          speakCue(`In ${t} meters, ${turn}.`)
+        }
+        break
+      }
+    }
+
+    if (currentEdgeRemainingM < threshold) {
       if (routeIndex === route.length - 1) {
         Promise.resolve().then(() => setArrived(true))
         speakCue('You have arrived at your destination.')
@@ -170,8 +220,10 @@ function NavigateContent() {
           setRouteIndex(i => i + 1)
         })
         const nextEdge = route[routeIndex + 1]
-        if (nextEdge?.landmark) {
-          speakCue(`Continue, then ${nextEdge.landmark}`)
+        if (nextEdge) {
+          const turn = getTurnDirection(currentEdge, nextEdge, graph)
+          const landmarkStr = nextEdge.landmark ? ` ${nextEdge.landmark}` : ` towards next waypoint`
+          speakCue(`${turn}, then continue${landmarkStr}`)
         }
       }
     }
@@ -318,19 +370,29 @@ function NavigateContent() {
 
         const pose = xrFrame.getViewerPose(refSpace)
 
-        // Improvement #6: IMU fallback when SLAM tracking is temporarily lost
         if (!pose) {
+          // Fallback: If WebXR completely loses tracking, we activate the step counter
+          if (calibrated && !imuTrackerRef.current.active) {
+            // Can't reliably get heading without a pose, so we rely on the last set heading
+            imuTrackerRef.current.start(lastHeadingRef.current) 
+          }
           if (calibrated && imuTrackerRef.current.active) {
             const delta = imuTrackerRef.current.getDeltaM()
             if (delta.dx !== 0 || delta.dy !== 0) {
-              xrTrackerRef.current.applyExternalDelta(delta.dx, delta.dy)
               imuTrackerRef.current.resetDelta()
+              // Because we return early, we need to update state manually based on the delta
+              // We do NOT apply this to xrTrackerRef because when SLAM recovers, WebXR will provide
+              // the true updated position natively. Applying it to xrTracker would cause double-counting.
+              setCurrentX(prev => prev + delta.dx)
+              setCurrentY(prev => prev + delta.dy)
             }
           }
           return
-        } else if (calibrated && imuTrackerRef.current.active) {
-          // SLAM tracking recovered or active — reset IMU step accumulator
-          imuTrackerRef.current.resetDelta()
+        }
+
+        // Tracking is active, so stop the fallback IMU tracker
+        if (imuTrackerRef.current.active) {
+          imuTrackerRef.current.stop()
         }
 
         // Improvement #3: Deferred calibration (wait for user confirmation tap)
@@ -340,11 +402,11 @@ function NavigateContent() {
             if (routeStateRef.current.route && routeStateRef.current.route.length > 0 && graphRef.current) {
               const firstNode = graphRef.current.nodes[routeStateRef.current.route[0].toNode]
               if (firstNode) {
-                mapAngle = Math.atan2(firstNode.y - startY, firstNode.x - startX)
+                mapAngle = Math.atan2(firstNode.y - currentY, firstNode.x - currentX)
               }
             }
             xrTrackerRef.current.recalibrate(
-              { x: startX, y: startY, floor: startFloor },
+              { x: currentX, y: currentY, floor: currentFloor },
               pose,
               mapAngle,
               compassHeading ?? undefined
@@ -376,6 +438,7 @@ function NavigateContent() {
 
         const rawPos = xrTrackerRef.current.getWorldPosition(pose)
         const deviceHeading = xrTrackerRef.current.getHeading(pose)
+        lastHeadingRef.current = deviceHeading
         
         // Pass the synchronized map heading to the IMU tracker
         if (imuTrackerRef.current.active) {

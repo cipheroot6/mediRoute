@@ -14,19 +14,8 @@ function ScanContent() {
   useEffect(() => {
     if (!anchorId) return
 
-    // Check sessionStorage first — if we already fetched this anchor during
-    // this hospital visit, use the cached copy.
-    const cacheKey = `anchor:${anchorId}`
-    const cached = sessionStorage.getItem(cacheKey)
-
-    const resolveAnchor = cached
-      ? Promise.resolve(JSON.parse(cached))
-      : fetch(`/api/anchor/${anchorId}`, { signal: AbortSignal.timeout(10_000) })
-          .then(r => r.json())
-          .then(data => {
-            if (!data.error) sessionStorage.setItem(cacheKey, JSON.stringify(data))
-            return data
-          })
+    const resolveAnchor = fetch(`/api/anchor/${anchorId}`, { signal: AbortSignal.timeout(10_000) })
+      .then(r => r.json())
 
     resolveAnchor
       .then(data => {

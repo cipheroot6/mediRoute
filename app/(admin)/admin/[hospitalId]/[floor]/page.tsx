@@ -3,6 +3,7 @@ import { useState, useRef, useEffect, use } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Plus, Maximize, Move, Upload, X, ZoomIn, ZoomOut, Trash2, Loader2 } from 'lucide-react'
 import { NODE_HIT_THRESHOLD_PX } from '@/lib/constants'
+import { useRouter } from 'next/navigation'
 
 const SCALE_PRESETS = [
   { label: 'Corridor 2.4m', value: 2.4 },
@@ -38,6 +39,8 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const { hospitalId, floor: floorParam } = use(params)
   const floorNumber = parseInt(floorParam, 10)
   
+  const router = useRouter()
+  
   const [floorPlanUrl, setFloorPlanUrl] = useState<string | null>(null)
   const [scaleMpp, setScaleMpp] = useState<number | null>(null)
   
@@ -47,6 +50,7 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
   const [loading, setLoading] = useState(true)
   const [zoom, setZoom] = useState(1)
   const [uploadStatus, setUploadStatus] = useState<string>('')
+  const [totalFloors, setTotalFloors] = useState<number>(1)
 
   // Calibration state
   const [calibStep, setCalibStep] = useState<CalibrationStep>('point-a')
@@ -87,13 +91,15 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
 
   useEffect(() => {
     async function loadData() {
-      // Fetch floor data directly or via API
-      const { data: floorData } = await supabase
-        .from('floors')
-        .select('*')
-        .eq('hospital_id', hospitalId)
-        .eq('floor_number', floorNumber)
-        .single()
+      // Fetch hospital and floor data
+      const [{ data: hospitalData }, { data: floorData }] = await Promise.all([
+        supabase.from('hospitals').select('floors').eq('id', hospitalId).single(),
+        supabase.from('floors').select('*').eq('hospital_id', hospitalId).eq('floor_number', floorNumber).single()
+      ])
+      
+      if (hospitalData) {
+        setTotalFloors(hospitalData.floors || 1)
+      }
         
       if (floorData) {
         setFloorPlanUrl(floorData.floor_plan_url)
@@ -522,8 +528,17 @@ export default function FloorPlanEditor({ params }: { params: Promise<{ hospital
     <div className="min-h-screen bg-background flex flex-col h-screen overflow-hidden">
       {/* Top Toolbar */}
       <div className="min-h-16 h-auto py-3 md:py-0 border-b border-border bg-black/80 backdrop-blur-xl flex flex-col md:flex-row items-start md:items-center justify-between px-4 md:px-6 gap-3 shrink-0 z-10">
-        <div>
-          <h1 className="font-medium text-lg">Hospital {hospitalId} <span className="text-muted-foreground mx-2">/</span> Floor {floorNumber}</h1>
+        <div className="flex items-center gap-2">
+          <h1 className="font-medium text-lg">Hospital {hospitalId} <span className="text-muted-foreground mx-2">/</span> Floor</h1>
+          <select 
+            value={floorNumber} 
+            onChange={e => router.push(`/admin/${hospitalId}/${e.target.value}`)}
+            className="bg-transparent border border-border rounded-md px-2 py-1 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-primary/20"
+          >
+            {Array.from({ length: totalFloors }, (_, i) => i + 1).map(f => (
+              <option key={f} value={f} className="bg-background">Floor {f}</option>
+            ))}
+          </select>
         </div>
         <div className="flex flex-wrap gap-2">
           <button

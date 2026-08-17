@@ -83,7 +83,16 @@ function getNavStep(
   const fromNode = graph.nodes[currentEdge.fromNode]
   if (!nextNode) return null
 
-  const dist = distanceM(currentX, currentY, nextNode.x, nextNode.y)
+  let dist = 0
+  if (fromNode) {
+    const geoTotal = distanceM(fromNode.x, fromNode.y, nextNode.x, nextNode.y)
+    const geoRemaining = distanceM(currentX, currentY, nextNode.x, nextNode.y)
+    const proportion = geoTotal > 0.001 ? Math.max(0, Math.min(1, geoRemaining / geoTotal)) : 0
+    dist = proportion * currentEdge.distanceM
+  } else {
+    dist = distanceM(currentX, currentY, nextNode.x, nextNode.y)
+  }
+
   const isLastEdge = idx === route.length - 1
 
   if (currentEdge.isElevator || currentEdge.isStairs) {
