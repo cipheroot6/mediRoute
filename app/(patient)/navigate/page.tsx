@@ -166,10 +166,26 @@ function NavigateContent() {
     // between the raw geometric distance and database-overridden edge distances.
     let currentEdgeRemainingM = dist
     const startNode = graph.nodes[currentEdge.fromNode]
+    
+    let hasPassedNode = false
+
     if (startNode) {
       const geoTotal = distanceM(startNode.x, startNode.y, nextNode.x, nextNode.y)
       const proportion = geoTotal > 0.001 ? Math.max(0, Math.min(1, dist / geoTotal)) : 0
       currentEdgeRemainingM = proportion * currentEdge.distanceM
+      
+      // Auto-advance if the user bypassed the node laterally but passed it longitudinally
+      if (routeIndex < route.length - 1 && geoTotal > 0.001) {
+        const dx = nextNode.x - startNode.x
+        const dy = nextNode.y - startNode.y
+        const t = ((currentX - startNode.x) * dx + (currentY - startNode.y) * dy) / (dx * dx + dy * dy)
+        const longitudinalDistToNode = (1 - t) * geoTotal
+        
+        // If they are longitudinally past the node, or within 1.0m of its perpendicular axis, auto-advance
+        if (longitudinalDistToNode < 1.0) {
+          hasPassedNode = true
+        }
+      }
     }
     
     // Improvement #7: Use 1.5m threshold for waypoints, 3.0m for final destination
@@ -207,7 +223,7 @@ function NavigateContent() {
       }
     }
 
-    if (currentEdgeRemainingM < threshold) {
+    if (currentEdgeRemainingM < threshold || hasPassedNode) {
       if (routeIndex === route.length - 1) {
         Promise.resolve().then(() => setArrived(true))
         speakCue('You have arrived at your destination.')
@@ -495,7 +511,7 @@ function NavigateContent() {
             const edge = currentRoute[i]
             if (edge.isElevator || edge.isStairs) break
             const targetNode = graphRef.current.nodes[edge.toNode]
-            if (!targetNode || targetNode.floor !== rawPos.floor) break
+            if (!targetNode || targetNode.floor !== currentFloor) break
             mapPoints.push({ x: targetNode.x, y: targetNode.y })
           }
 
