@@ -304,6 +304,7 @@ function NavigateContent() {
       scene.add(arrowsGroup)
 
       const pathGroup = new THREE.Group()
+      pathGroup.visible = false // Hidden to prevent clipping through walls
       scene.add(pathGroup)
 
       // Pre-allocate object pool for glowing floor walking pathway
