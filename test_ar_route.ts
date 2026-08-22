@@ -1,6 +1,6 @@
-import { findPath } from './lib/pathfinding/astar'
+import { astar } from './lib/pathfinding/astar'
 
-const nodes = {
+const nodes: Record<string, any> = {
   "n1": { id: "n1", floor: 1, x: 0, y: 0, hospitalId: "h1" },
   "n2": { id: "n2", floor: 1, x: 10, y: 0, hospitalId: "h1" },
   "n3": { id: "n3", floor: 2, x: 10, y: 0, hospitalId: "h1" },
@@ -18,22 +18,24 @@ const graph = { nodes, edges, anchors: {}, floors: {
   2: { floorPlanUrl: "url2", scaleMpp: 0.05 }
 } }
 
-const route = findPath("n1", "n4", graph, true)
+const route = astar(graph as any, "n1", "n4", 'standard')
 console.log(route)
 
 // Now simulate handleManualFloorChange
-let newFloor = 2
+const newFloor = 2
 let targetIndex = -1
 let targetNode = null
-for (let i = 0; i < route.length; i++) {
-  const edge = route[i]
-  const n = graph.nodes[edge.fromNode]
-  if (n && n.floor === newFloor && !edge.isElevator && !edge.isStairs) {
-    targetIndex = i
-    targetNode = n
-    break
+if (route) {
+  for (let i = 0; i < route.length; i++) {
+    const edge = route[i]
+    const n = graph.nodes[edge.fromNode]
+    if (n && n.floor === newFloor && !edge.isElevator && !edge.isStairs) {
+      targetIndex = i
+      targetNode = n
+      break
+    }
   }
 }
 console.log("handleManualFloorChange targetIndex:", targetIndex)
-console.log("route[targetIndex]:", route[targetIndex])
+console.log("route[targetIndex]:", route?.[targetIndex])
 

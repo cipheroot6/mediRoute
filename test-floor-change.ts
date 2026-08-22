@@ -5,7 +5,7 @@ const route = [
   { isElevator: false, fromNode: "D", toNode: "E" }  // F2 Dest
 ]
 
-const nodes = {
+const nodes: Record<string, { floor: number }> = {
   "A": { floor: 1 },
   "B": { floor: 1 },
   "C": { floor: 2 },
@@ -13,7 +13,7 @@ const nodes = {
   "E": { floor: 2 },
 }
 
-let newFloor = 2
+const newFloor = 2
 let targetIndex = -1
 let targetNode = null
 
