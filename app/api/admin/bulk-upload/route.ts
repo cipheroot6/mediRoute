@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabase/server'
+import type { BulkUploadNodeInput, BulkUploadEdgeInput } from '@/types'
 
 export async function POST(req: NextRequest) {
   try {
@@ -13,7 +14,7 @@ export async function POST(req: NextRequest) {
     const supabase = createAdminClient()
 
     // Add hospital_id and floor to all nodes, and map camelCase to snake_case
-    const formattedNodes = (nodes || []).map((n: any) => ({
+    const formattedNodes = ((nodes as BulkUploadNodeInput[]) || []).map((n) => ({
       id: n.id,
       hospital_id: hospitalId,
       floor: floor,
@@ -25,7 +26,7 @@ export async function POST(req: NextRequest) {
     }))
 
     // Add hospital_id to all edges, and map camelCase to snake_case
-    const formattedEdges = (edges || []).map((e: any) => ({
+    const formattedEdges = ((edges as BulkUploadEdgeInput[]) || []).map((e) => ({
       id: e.id,
       hospital_id: hospitalId,
       from_node: e.fromNode,
@@ -52,7 +53,8 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({ ok: true })
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message || 'Internal Server Error' }, { status: 500 })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Internal Server Error'
+    return NextResponse.json({ error: message }, { status: 500 })
   }
 }

@@ -31,6 +31,7 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files
+.env
 .env.local
 .env*.local
 
@@ -44,9 +45,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-*.md 
-!README.md
-!AGENTS.md
-!app/AGENTS.md
+certificates/
 certificates
 *.pdf

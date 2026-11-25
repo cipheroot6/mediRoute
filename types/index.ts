@@ -70,3 +70,24 @@ export type NavigationState = {
 export interface WebkitDeviceOrientationEvent extends DeviceOrientationEvent {
   webkitCompassHeading?: number
 }
+
+export interface BulkUploadNodeInput {
+  id?: string
+  label: string
+  type: NodeType
+  x: number
+  y: number
+  accessible?: boolean
+}
+
+export interface BulkUploadEdgeInput {
+  id?: string
+  fromNode: string
+  toNode: string
+  distanceM: number
+  accessible?: boolean
+  isStairs?: boolean
+  isElevator?: boolean
+  landmark?: string | null
+}
+

@@ -1,13 +1,16 @@
 {
   "name": "mediroute",
   "version": "0.1.0",
-  "private": true,
+  "description": "Augmented reality indoor hospital navigation platform with WebXR SLAM tracking, wheelchair-accessible A* pathfinding, and real-time voice guidance.",
+  "license": "MIT",
   "scripts": {
     "dev": "next dev",
     "dev:network": "next dev -H 0.0.0.0 --experimental-https",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/astar.test.ts && tsx tests/ar-tracking.test.ts && tsx tests/ar-route.test.ts && tsx tests/floor-change.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.3",
@@ -34,6 +37,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.10",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }
